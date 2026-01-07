@@ -106,6 +106,87 @@ pub async fn run_nix_eval_jobs(
     Ok(results)
 }
 
+/// Run nix-eval-jobs for a specific package set (e.g., "python3Packages")
+/// If pkgset is empty, evaluates all packages.
+///
+/// For sub-attrsets like `python3Packages`, we add `recurseForDerivations = true`
+/// to tell nix-eval-jobs to recurse into the attribute set.
+pub async fn run_nix_eval_jobs_pkgset(
+    nixpkgs_path: &PathBuf,
+    pkgset: &str,
+    system: &str,
+    workers: usize,
+) -> Result<Vec<EvalJobOutput>> {
+    let expr = if pkgset.is_empty() {
+        // Full nixpkgs evaluation
+        format!(
+            "import {} {{ system = \"{}\"; config = {{ allowUnfree = true; }}; }}",
+            nixpkgs_path.display(),
+            system
+        )
+    } else {
+        // Sub-attrset: add recurseForDerivations to make nix-eval-jobs recurse into it
+        format!(
+            "let pkgs = import {} {{ system = \"{}\"; config = {{ allowUnfree = true; }}; }}; in pkgs.{} // {{ recurseForDerivations = true; }}",
+            nixpkgs_path.display(),
+            system,
+            pkgset
+        )
+    };
+    let apply_expr = get_apply_expr();
+    let workers_str = workers.to_string();
+
+    info!(
+        "Running nix-eval-jobs for pkgset '{}' with {} workers...",
+        if pkgset.is_empty() { "<all>" } else { pkgset },
+        workers
+    );
+    debug!("Expression: {}", expr);
+    debug!("Apply expression: {}", apply_expr);
+
+    let output = TokioCommand::new("nix-eval-jobs")
+        .args([
+            "--expr",
+            &expr,
+            "--apply",
+            &apply_expr,
+            "--workers",
+            &workers_str,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("Failed to run nix-eval-jobs")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            "nix-eval-jobs exited with status {}: {}",
+            output.status, stderr
+        );
+        // Continue anyway - we'll process what we got
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut results = Vec::new();
+
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<EvalJobOutput>(line) {
+            Ok(job) => results.push(job),
+            Err(e) => {
+                debug!("Failed to parse nix-eval-jobs line: {} - {}", e, line);
+            }
+        }
+    }
+
+    info!("nix-eval-jobs returned {} packages", results.len());
+    Ok(results)
+}
+
 /// TODO this is a hack.
 /// It would be better to build this as
 /// - build the thing pulling EVERYTHING from cache

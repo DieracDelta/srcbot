@@ -1,4 +1,5 @@
 mod cache;
+mod check_all;
 mod cli;
 mod commands;
 mod fix_hash;
@@ -16,6 +17,7 @@ use clap::Parser;
 use tracing::{error, info};
 
 use cache::init_save_location;
+use check_all::process_check_all;
 use cli::{Args, Commands};
 use fix_hash::process_fix_hash;
 use full_eval::process_pr_full_eval;
@@ -123,6 +125,24 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => {
                     error!("Error fixing hash: {}", e);
+                    std::process::exit(1)
+                }
+            }
+        }
+
+        Commands::CheckAll(check_args) => {
+            match process_check_all(&check_args).await {
+                Ok(success) => {
+                    if success {
+                        info!("All checks passed");
+                        Ok(())
+                    } else {
+                        error!("Some checks failed");
+                        std::process::exit(1)
+                    }
+                }
+                Err(e) => {
+                    error!("Error during check-all: {}", e);
                     std::process::exit(1)
                 }
             }

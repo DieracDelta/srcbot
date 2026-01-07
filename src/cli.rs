@@ -20,6 +20,9 @@ pub enum Commands {
 
     /// Fix a hash mismatch for a known attribute
     FixHash(FixHashArgs),
+
+    /// Check all intermediate attributes in a package set
+    CheckAll(CheckAllArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -123,6 +126,35 @@ pub struct FixHashArgs {
     pub no_pr_text: bool,
 }
 
+#[derive(Parser, Debug)]
+pub struct CheckAllArgs {
+    /// Package set to check (e.g., "python3Packages", "" for root/all packages)
+    pub pkgset: String,
+
+    /// Path to nixpkgs checkout
+    pub nixpkgs: PathBuf,
+
+    /// System to build for
+    #[arg(long, default_value = "x86_64-linux")]
+    pub system: String,
+
+    /// Number of parallel workers for nix-eval-jobs
+    #[arg(long, default_value_t = num_cpus::get())]
+    pub eval_workers: usize,
+
+    /// Maximum parallel builds
+    #[arg(long, default_value_t = 4)]
+    pub build_jobs: usize,
+
+    /// Optional file path to write failure details as JSON
+    #[arg(long)]
+    pub failures_file: Option<PathBuf>,
+
+    /// Maximum number of packages to build (useful for testing)
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +234,119 @@ mod tests {
         } else {
             panic!("Expected Verify command");
         }
+    }
+
+    #[test]
+    fn test_check_all_basic() {
+        // Basic check-all command with pkgset and nixpkgs path
+        let args =
+            Args::try_parse_from(["srcbot", "check-all", "python3Packages", "/path/to/nixpkgs"])
+                .unwrap();
+        if let Commands::CheckAll(check_args) = args.command {
+            assert_eq!(check_args.pkgset, "python3Packages");
+            assert_eq!(
+                check_args.nixpkgs,
+                std::path::PathBuf::from("/path/to/nixpkgs")
+            );
+        } else {
+            panic!("Expected CheckAll command");
+        }
+    }
+
+    #[test]
+    fn test_check_all_empty_pkgset() {
+        // Check-all with empty pkgset (root packages)
+        let args = Args::try_parse_from(["srcbot", "check-all", "", "."]).unwrap();
+        if let Commands::CheckAll(check_args) = args.command {
+            assert_eq!(check_args.pkgset, "");
+            assert_eq!(check_args.nixpkgs, std::path::PathBuf::from("."));
+        } else {
+            panic!("Expected CheckAll command");
+        }
+    }
+
+    #[test]
+    fn test_check_all_defaults() {
+        // Verify all the important defaults for CheckAllArgs
+        let args = Args::try_parse_from(["srcbot", "check-all", "python3Packages", "."]).unwrap();
+        if let Commands::CheckAll(check_args) = args.command {
+            assert_eq!(check_args.system, "x86_64-linux");
+            assert_eq!(check_args.build_jobs, 4);
+            assert!(check_args.failures_file.is_none());
+            assert!(check_args.limit.is_none());
+            // eval_workers defaults to num_cpus, just check it's > 0
+            assert!(check_args.eval_workers > 0);
+        } else {
+            panic!("Expected CheckAll command");
+        }
+    }
+
+    #[test]
+    fn test_check_all_with_options() {
+        // Check-all with all options specified
+        let args = Args::try_parse_from([
+            "srcbot",
+            "check-all",
+            "nodePackages",
+            "/nix/store/nixpkgs",
+            "--system",
+            "aarch64-linux",
+            "--eval-workers",
+            "8",
+            "--build-jobs",
+            "16",
+            "--failures-file",
+            "/tmp/failures.json",
+            "--limit",
+            "100",
+        ])
+        .unwrap();
+        if let Commands::CheckAll(check_args) = args.command {
+            assert_eq!(check_args.pkgset, "nodePackages");
+            assert_eq!(
+                check_args.nixpkgs,
+                std::path::PathBuf::from("/nix/store/nixpkgs")
+            );
+            assert_eq!(check_args.system, "aarch64-linux");
+            assert_eq!(check_args.eval_workers, 8);
+            assert_eq!(check_args.build_jobs, 16);
+            assert_eq!(
+                check_args.failures_file,
+                Some(std::path::PathBuf::from("/tmp/failures.json"))
+            );
+            assert_eq!(check_args.limit, Some(100));
+        } else {
+            panic!("Expected CheckAll command");
+        }
+    }
+
+    #[test]
+    fn test_check_all_with_limit() {
+        // Test --limit flag specifically
+        let args =
+            Args::try_parse_from(["srcbot", "check-all", "python3Packages", ".", "--limit", "50"])
+                .unwrap();
+        if let Commands::CheckAll(check_args) = args.command {
+            assert_eq!(check_args.limit, Some(50));
+        } else {
+            panic!("Expected CheckAll command");
+        }
+
+        // Test with limit of 1 (edge case)
+        let args =
+            Args::try_parse_from(["srcbot", "check-all", "python3Packages", ".", "--limit", "1"])
+                .unwrap();
+        if let Commands::CheckAll(check_args) = args.command {
+            assert_eq!(check_args.limit, Some(1));
+        } else {
+            panic!("Expected CheckAll command");
+        }
+    }
+
+    #[test]
+    fn test_check_all_missing_args() {
+        // Should fail if pkgset or nixpkgs is missing
+        assert!(Args::try_parse_from(["srcbot", "check-all"]).is_err());
+        assert!(Args::try_parse_from(["srcbot", "check-all", "python3Packages"]).is_err());
     }
 }

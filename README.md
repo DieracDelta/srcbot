@@ -34,7 +34,7 @@ The goal is of this tool is primarily to:
 - check that the source/intermediate attributes of a derivation changed by a PR is actually correct. This can be used to ensure there are no hash mismatches for a derivation. Note that this parses the title of the PR to decide which attribute to use (unless you specify differently)
 - completely verify that all changed attributes between HEAD and the base of a PR using nix-eval-jobs (--full-eval flag of verify subcommand) are still able to be built
 - Given an attribute that has mismatched hashes, fix the mismatched hashes and push to a branch and generate text to make a PR with that links to a locally hosted version of the build logs. An example of this is [hosted here](https://instance-20251227-2125.tail5ca7.ts.net/srcbot-srv/). We seemingly have a lot of mismatched hashes in nixpkgs.
-- Iterate through all attributes in a pkgset, and build their intermediate attributes. This was implemented, then broke, and I haven't re-added it yet
+- Iterate through all attributes in a pkgset, and build their intermediate attributes. I used this on an old iteration, but revamped it. I'm not confident this works well.
 - Drop packages and auto push to a branch, and generate PR text. This is not yet implemented, but I really feel like dropping a package should be automated so we don't have to mess around with checking the date. We should just provide a reason and srcbot should just figure out where to insert the drop for each pkgset in the related aliases file
 
 The first three features I've tested pretty heavily and am confident work well

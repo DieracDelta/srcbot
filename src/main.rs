@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
                         verify_args.resume,
                         verify_args.full_rebuild,
                         verify_args.false_positive,
+                        verify_args.verify_full_drvs,
                     )
                     .await
                 } else {

@@ -26,6 +26,9 @@ cargo run --release -- fix-hash  --save-location /srv/srcbot --nixpkgs /home/jre
 
 # iterate all intermediate attributes in python3Packages and ensure they build from source
 cargo run --release -- check-all python3Packages /home/jrestivo/dev/nixpkgs --limit 10
+
+# nixpkgs-review style "build all drvs that changed and also all immediate attributes"
+cargo run --release -- verify --full-eval --prs 477487 --false-positive --nixpkgs /home/jrestivo/dev/nixpkgs  --verify-full-drvs
 ```
 
 # What does this implement

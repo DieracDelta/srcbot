@@ -22,8 +22,13 @@ use crate::types::{
     ChangedPackage, ChangedPackageSer, FullEvalBuildResult, RunState, INTERMEDIATE_ATTRS,
 };
 
-/// Find packages whose intermediate drvPaths changed between base and PR
-pub fn find_changed_packages(base: &[EvalJobOutput], pr: &[EvalJobOutput]) -> Vec<ChangedPackage> {
+/// Find packages whose intermediate drvPaths changed between base and PR.
+/// If `verify_full_drvs` is true, also include packages where only the final drvPath changed.
+pub fn find_changed_packages(
+    base: &[EvalJobOutput],
+    pr: &[EvalJobOutput],
+    verify_full_drvs: bool,
+) -> Vec<ChangedPackage> {
     // Build lookup map for base packages
     let base_map: HashMap<&str, &EvalJobOutput> =
         base.iter().map(|p| (p.attr.as_str(), p)).collect();
@@ -36,10 +41,7 @@ pub fn find_changed_packages(base: &[EvalJobOutput], pr: &[EvalJobOutput]) -> Ve
             continue;
         }
 
-        let pr_intermediates = match &pr_pkg.extra_value {
-            Some(m) => m,
-            None => continue,
-        };
+        let pr_intermediates = pr_pkg.extra_value.as_ref();
 
         // If package is new or intermediates changed, add it
         let base_pkg = base_map.get(pr_pkg.attr.as_str());
@@ -48,25 +50,28 @@ pub fn find_changed_packages(base: &[EvalJobOutput], pr: &[EvalJobOutput]) -> Ve
         let mut changed_intermediates = Vec::new();
         let mut intermediate_drv_paths = HashMap::new();
 
-        for (name, pr_drv) in pr_intermediates {
-            let pr_drv = match pr_drv {
-                Some(d) => d,
-                None => continue,
-            };
+        // Check intermediate changes (if package has intermediates)
+        if let Some(pr_ints) = pr_intermediates {
+            for (name, pr_drv) in pr_ints {
+                let pr_drv = match pr_drv {
+                    Some(d) => d,
+                    None => continue,
+                };
 
-            let base_drv = base_intermediates
-                .and_then(|m| m.get(name))
-                .and_then(|v| v.as_ref());
+                let base_drv = base_intermediates
+                    .and_then(|m| m.get(name))
+                    .and_then(|v| v.as_ref());
 
-            // Changed if: new intermediate, or drvPath differs
-            let is_changed = match base_drv {
-                Some(bd) => bd != pr_drv,
-                None => true,
-            };
+                // Changed if: new intermediate, or drvPath differs
+                let is_changed = match base_drv {
+                    Some(bd) => bd != pr_drv,
+                    None => true,
+                };
 
-            if is_changed {
-                changed_intermediates.push(name.clone());
-                intermediate_drv_paths.insert(name.clone(), pr_drv.clone());
+                if is_changed {
+                    changed_intermediates.push(name.clone());
+                    intermediate_drv_paths.insert(name.clone(), pr_drv.clone());
+                }
             }
         }
 
@@ -83,13 +88,38 @@ pub fn find_changed_packages(base: &[EvalJobOutput], pr: &[EvalJobOutput]) -> Ve
                 attr: pr_pkg.attr.clone(),
                 changed_intermediates,
                 intermediate_drv_paths,
+                final_drv_changed: false,
             });
+        } else if verify_full_drvs {
+            // No intermediate changes - check if final drvPath changed
+            let base_drv = base_pkg.and_then(|p| p.drv_path.as_ref());
+            let pr_drv = pr_pkg.drv_path.as_ref();
+
+            if let Some(pr_d) = pr_drv {
+                let final_changed = match base_drv {
+                    Some(bd) => bd != pr_d,
+                    None => true, // New package
+                };
+
+                if final_changed {
+                    changed.push(ChangedPackage {
+                        attr: pr_pkg.attr.clone(),
+                        changed_intermediates: vec![],
+                        intermediate_drv_paths: HashMap::new(),
+                        final_drv_changed: true,
+                    });
+                }
+            }
         }
     }
 
+    let intermediate_count = changed.iter().filter(|p| !p.changed_intermediates.is_empty()).count();
+    let final_only_count = changed.iter().filter(|p| p.final_drv_changed).count();
+
     info!(
-        "Found {} packages with changed intermediates",
-        changed.len()
+        "Found {} packages with changed intermediates, {} with only final drvPath changed",
+        intermediate_count,
+        final_only_count
     );
     changed
 }
@@ -99,6 +129,7 @@ pub fn find_changed_packages(base: &[EvalJobOutput], pr: &[EvalJobOutput]) -> Ve
 /// If `full_rebuild` is true, uses the old behavior (prune store paths, rebuild with --substituters "").
 /// If `full_rebuild` is false (default), uses cache-friendly mode (allow cache, verify with --check).
 /// If `false_positive` is true, when a build fails, check if it also fails on the base branch.
+/// If `verify_full_drvs` is true, also detect packages where the final drvPath changed (not just intermediates).
 pub async fn process_pr_full_eval(
     pr_num: u64,
     token: Option<&String>,
@@ -111,6 +142,7 @@ pub async fn process_pr_full_eval(
     resume: bool,
     full_rebuild: bool,
     false_positive: bool,
+    verify_full_drvs: bool,
 ) -> Result<bool> {
     info!("srcbot: Full evaluation mode for PR #{}", pr_num);
 
@@ -204,6 +236,7 @@ pub async fn process_pr_full_eval(
                     attr: p.attr.clone(),
                     changed_intermediates: p.changed_intermediates.clone(),
                     intermediate_drv_paths: HashMap::new(), // Not needed for building
+                    final_drv_changed: p.final_drv_changed,
                 }
             })
             .collect();
@@ -281,12 +314,17 @@ pub async fn process_pr_full_eval(
         };
 
         // Find changed packages
-        let changed = find_changed_packages(&base_packages, &pr_packages);
+        let changed = find_changed_packages(&base_packages, &pr_packages, verify_full_drvs);
         (changed, Vec::new(), HashMap::new(), false)
     };
 
     if changed.is_empty() {
-        info!("No packages with changed intermediates found!");
+        let msg = if verify_full_drvs {
+            "No packages with changed intermediates or drvPaths found!"
+        } else {
+            "No packages with changed intermediates found!"
+        };
+        info!("{}", msg);
 
         // Cleanup PR worktree (base worktree already cleaned up or never created due to cache)
         let _ = run_command_async(
@@ -304,11 +342,12 @@ pub async fn process_pr_full_eval(
 
         if !dry_run {
             if let Some(token_str) = token {
-                post_github_comment(
-                    pr_num,
-                    token_str,
-                    "## srcbot: Full Evaluation Results\n\nNo packages with changed source intermediates detected.",
-                ).await?;
+                let comment_msg = if verify_full_drvs {
+                    "## srcbot: Full Evaluation Results\n\nNo packages with changed intermediates or drvPaths detected."
+                } else {
+                    "## srcbot: Full Evaluation Results\n\nNo packages with changed source intermediates detected."
+                };
+                post_github_comment(pr_num, token_str, comment_msg).await?;
             }
         }
         return Ok(true);
@@ -332,7 +371,11 @@ pub async fn process_pr_full_eval(
     );
 
     for pkg in &remaining_packages {
-        info!("  - {}: {:?}", pkg.attr, pkg.changed_intermediates);
+        if pkg.final_drv_changed {
+            info!("  - {}: [final drvPath changed]", pkg.attr);
+        } else {
+            info!("  - {}: {:?}", pkg.attr, pkg.changed_intermediates);
+        }
     }
 
     // Create shared state for saving progress
@@ -346,6 +389,7 @@ pub async fn process_pr_full_eval(
             .map(|p| ChangedPackageSer {
                 attr: p.attr.clone(),
                 changed_intermediates: p.changed_intermediates.clone(),
+                final_drv_changed: p.final_drv_changed,
             })
             .collect(),
         intermediate_results: saved_intermediate_results.clone(),

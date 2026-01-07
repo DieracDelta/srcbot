@@ -7,8 +7,7 @@ use std::collections::HashMap;
 pub struct EvalJobOutput {
     /// Attr path (examples: "hello", "python3Packages.requests")
     pub attr: String,
-    /// Derivation path (unused right now)
-    #[allow(dead_code)]
+    /// Derivation path (final package drvPath)
     pub drv_path: Option<String>,
     /// Error message if evaluation failed
     pub error: Option<String>,

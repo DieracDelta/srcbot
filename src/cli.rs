@@ -82,6 +82,11 @@ pub struct VerifyArgs {
     /// Only used with --full-eval.
     #[arg(long, default_value_t = false)]
     pub false_positive: bool,
+
+    /// Also detect and build packages where the final drvPath changed (not just intermediates).
+    /// Only used with --full-eval.
+    #[arg(long, default_value_t = false)]
+    pub verify_full_drvs: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -395,5 +400,64 @@ mod tests {
         // Should fail if pkgset or nixpkgs is missing
         assert!(Args::try_parse_from(["srcbot", "check-all"]).is_err());
         assert!(Args::try_parse_from(["srcbot", "check-all", "python3Packages"]).is_err());
+    }
+
+    #[test]
+    fn test_verify_full_drvs_flag_default_false() {
+        // Default (no flag) should be false
+        let args = Args::try_parse_from(["srcbot", "verify", "--prs", "12345"]).unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert!(
+                !verify_args.verify_full_drvs,
+                "--verify-full-drvs should default to false"
+            );
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_verify_full_drvs_flag_true_when_set() {
+        // --verify-full-drvs should be true when explicitly set
+        let args = Args::try_parse_from([
+            "srcbot",
+            "verify",
+            "--full-eval",
+            "--verify-full-drvs",
+            "--prs",
+            "12345",
+        ])
+        .unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert!(
+                verify_args.verify_full_drvs,
+                "--verify-full-drvs should be true when set"
+            );
+            assert!(verify_args.full_eval, "--full-eval should be true");
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_verify_full_drvs_with_false_positive() {
+        // --verify-full-drvs should work together with --false-positive
+        let args = Args::try_parse_from([
+            "srcbot",
+            "verify",
+            "--full-eval",
+            "--verify-full-drvs",
+            "--false-positive",
+            "--prs",
+            "12345",
+        ])
+        .unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert!(verify_args.verify_full_drvs, "--verify-full-drvs should be true");
+            assert!(verify_args.false_positive, "--false-positive should be true");
+            assert!(verify_args.full_eval, "--full-eval should be true");
+        } else {
+            panic!("Expected Verify command");
+        }
     }
 }

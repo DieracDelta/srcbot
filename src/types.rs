@@ -57,7 +57,7 @@ pub const INTERMEDIATE_ATTRS: &[&str] = &[
     "mixFodDeps", // (buildMixRelease)
 ];
 
-/// A package whose intermediates changed between base and PR
+/// A package whose intermediates or final drvPath changed between base and PR
 #[derive(Debug, Clone)]
 pub struct ChangedPackage {
     /// Attr path
@@ -67,6 +67,9 @@ pub struct ChangedPackage {
     /// The drvPaths for each changed intermediate (PR version) - kept for potential future use
     #[allow(dead_code)]
     pub intermediate_drv_paths: HashMap<String, String>,
+    /// True if the final package drvPath changed (but intermediates didn't)
+    /// Only populated when --verify-full-drvs is used
+    pub final_drv_changed: bool,
 }
 
 /// Result of building a package in full-eval mode
@@ -86,6 +89,9 @@ pub struct FullEvalBuildResult {
 pub struct ChangedPackageSer {
     pub attr: String,
     pub changed_intermediates: Vec<String>,
+    /// True if the final package drvPath changed (but intermediates didn't)
+    #[serde(default)]
+    pub final_drv_changed: bool,
 }
 
 /// Saved state for resuming a run
@@ -259,6 +265,7 @@ mod tests {
             packages_to_build: vec![ChangedPackageSer {
                 attr: "hello".to_string(),
                 changed_intermediates: vec!["src".to_string()],
+                final_drv_changed: false,
             }],
             intermediate_results: HashMap::new(),
             completed_results: vec![],
@@ -276,10 +283,37 @@ mod tests {
         let pkg = ChangedPackageSer {
             attr: "myPackage".to_string(),
             changed_intermediates: vec!["src".to_string(), "cargoDeps".to_string()],
+            final_drv_changed: false,
         };
         let json = serde_json::to_string(&pkg).unwrap();
         let deserialized: ChangedPackageSer = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.attr, "myPackage");
         assert_eq!(deserialized.changed_intermediates.len(), 2);
+        assert!(!deserialized.final_drv_changed);
+    }
+
+    #[test]
+    fn test_changed_package_ser_final_drv_changed() {
+        let pkg = ChangedPackageSer {
+            attr: "finalOnlyPkg".to_string(),
+            changed_intermediates: vec![],
+            final_drv_changed: true,
+        };
+        let json = serde_json::to_string(&pkg).unwrap();
+        let deserialized: ChangedPackageSer = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.final_drv_changed);
+        assert!(deserialized.changed_intermediates.is_empty());
+    }
+
+    #[test]
+    fn test_changed_package_ser_backwards_compat() {
+        // Test that old serialized data without final_drv_changed field works
+        let json = r#"{
+            "attr": "old-pkg",
+            "changed_intermediates": ["src"]
+        }"#;
+        let deserialized: ChangedPackageSer = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized.attr, "old-pkg");
+        assert!(!deserialized.final_drv_changed); // defaults to false
     }
 }

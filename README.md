@@ -4,7 +4,7 @@ Another disclaimer: this was written as an attempt to globally fix problems I fo
 
 # What is this
 
-A completement to nixpkgs-review with the purpose of automating tasks in nixpkgs
+A complement to nixpkgs-review with the purpose of automating tasks in nixpkgs
 
 # How to use
 

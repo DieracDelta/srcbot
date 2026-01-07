@@ -6,6 +6,25 @@ Another disclaimer: this was written as an attempt to globally fix problems I fo
 
 A completement to nixpkgs-review with the purpose of automating tasks in nixpkgs
 
+# How to use
+
+There's four useful things that you can do
+
+```bash
+# build all intermediate attributes that exist based on PR title (aka: python3Packages.pyairplanes: 1.0 -> 2.0)
+cargo run --release -- verify --prs 475668  --nixpkgs /home/jrestivo/dev/nixpkgs
+
+# check custom attribute of a PR
+cargo run --release -- verify --prs 475668  --nixpkgs /home/jrestivo/dev/nixpkgs --attr bazel_7.bazelDeps
+
+# check all changed attributes (requires nix-eval-jobs)
+cargo run --release --  --prs 473846 --full-eval --nixpkgs /home/jrestivo/dev/nixpkgs --build-jobs 2
+
+# fix a hash and push it to a branch
+# saving build logs to confirm it actually worked
+cargo run --release -- fix-hash  --save-location /srv/srcbot --nixpkgs /home/jrestivo/dev/nixpkgs --attribute invidtui --intermediate goModules --origin o2
+```
+
 # What does this implement
 
 Define an intermediate attribute of a derivation as "source" in some sense. Where that's maybe `mydrv.src` or some vendored dependency like `cargoDeps`.

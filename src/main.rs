@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
                         verify_args.build_jobs,
                         verify_args.resume,
                         verify_args.full_rebuild,
+                        verify_args.false_positive,
                     )
                     .await
                 } else {

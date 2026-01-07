@@ -138,6 +138,38 @@ pub fn get_log_dir(pr_num: u64) -> Result<PathBuf> {
     Ok(log_dir)
 }
 
+/// Save a single build log file with optional commit suffix
+/// Used for saving base build logs during false positive checks
+///
+/// # Arguments
+/// * `pr_num` - PR number for directory
+/// * `attr` - Package attribute (e.g., "python3Packages.requests")
+/// * `step` - Build step (e.g., "src", "goModules", or "package")
+/// * `logs` - Log content
+/// * `commit_suffix` - Optional commit hash suffix (e.g., "abc12345" for base builds)
+///
+/// # Returns
+/// Path to the saved log file
+pub fn save_single_log(
+    pr_num: u64,
+    attr: &str,
+    step: &str,
+    logs: &str,
+    commit_suffix: Option<&str>,
+) -> Result<PathBuf> {
+    let log_dir = get_log_dir(pr_num)?;
+    let attr_safe = attr.replace('.', "_").replace('/', "_");
+
+    let log_name = match commit_suffix {
+        Some(suffix) => format!("{}.{}.base-{}.log", attr_safe, step, suffix),
+        None => format!("{}.{}.log", attr_safe, step),
+    };
+
+    let log_path = log_dir.join(&log_name);
+    fs::write(&log_path, logs)?;
+    Ok(log_path)
+}
+
 /// Get the log directory for a specific attribute in fix-hash operations
 /// Structure: {base_dir}/logs/{attr_safe}/
 pub fn get_fix_hash_attr_log_dir(attr: &str) -> Result<PathBuf> {

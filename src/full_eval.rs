@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::cache::{
     delete_run_state, load_cached_eval, load_run_state, save_eval_cache, save_logs_locally,
-    save_run_state,
+    save_run_state, save_single_log,
 };
 use crate::commands::run_command_async;
 use crate::full_eval_types::EvalJobOutput;
@@ -98,6 +98,7 @@ pub fn find_changed_packages(base: &[EvalJobOutput], pr: &[EvalJobOutput]) -> Ve
 ///
 /// If `full_rebuild` is true, uses the old behavior (prune store paths, rebuild with --substituters "").
 /// If `full_rebuild` is false (default), uses cache-friendly mode (allow cache, verify with --check).
+/// If `false_positive` is true, when a build fails, check if it also fails on the base branch.
 pub async fn process_pr_full_eval(
     pr_num: u64,
     token: Option<&String>,
@@ -109,6 +110,7 @@ pub async fn process_pr_full_eval(
     build_jobs: usize,
     resume: bool,
     full_rebuild: bool,
+    false_positive: bool,
 ) -> Result<bool> {
     info!("srcbot: Full evaluation mode for PR #{}", pr_num);
 
@@ -168,6 +170,9 @@ pub async fn process_pr_full_eval(
     let temp_dir = TempDir::new()?;
     let base_path = temp_dir.path().join("base");
     let pr_path = temp_dir.path().join("pr");
+
+    // Track whether base worktree exists (for false positive checks)
+    let base_worktree_exists = Arc::new(Mutex::new(false));
 
     info!("Creating PR worktree (PR head) at {:?}", pr_path);
     run_command_async(
@@ -229,6 +234,9 @@ pub async fn process_pr_full_eval(
             )
             .await?;
 
+            // Mark base worktree as existing
+            *base_worktree_exists.lock().unwrap() = true;
+
             info!("Evaluating base nixpkgs...");
             let packages = run_nix_eval_jobs(&base_path, system, eval_workers).await?;
 
@@ -237,19 +245,21 @@ pub async fn process_pr_full_eval(
                 warn!("Failed to save eval cache: {}", e);
             }
 
-            // Cleanup base worktree since we're done with it
-            let _ = run_command_async(
-                "git",
-                &[
-                    "-C",
-                    nixpkgs.to_str().unwrap(),
-                    "worktree",
-                    "remove",
-                    "-f",
-                    base_path.to_str().unwrap(),
-                ],
-            )
-            .await;
+            // Cleanup base worktree only if we don't need it for false positive checks
+            if !false_positive {
+                let _ = run_command_async(
+                    "git",
+                    &[
+                        "-C",
+                        nixpkgs.to_str().unwrap(),
+                        "worktree",
+                        "remove",
+                        "-f",
+                        base_path.to_str().unwrap(),
+                    ],
+                )
+                .await;
+            }
 
             packages
         };
@@ -414,6 +424,7 @@ pub async fn process_pr_full_eval(
                     intermediate_results: saved_intermediates,
                     package_success: false,
                     package_logs: String::new(),
+                    is_false_positive: false,
                 },
             )
         })
@@ -472,6 +483,79 @@ pub async fn process_pr_full_eval(
         while let Some((attr, intermediate_name, success, logs)) = stream.next().await {
             // Log is already streamed to file by build_intermediate_async
 
+            // Check for false positive if build failed and flag is set
+            let mut is_fp = false;
+            if !success && false_positive {
+                // Ensure base worktree exists (create lazily if needed from cached eval)
+                let needs_worktree = !*base_worktree_exists.lock().unwrap();
+                if needs_worktree {
+                    info!(
+                        "Creating base worktree for false positive check at {:?}",
+                        base_path
+                    );
+                    if let Err(e) = run_command_async(
+                        "git",
+                        &[
+                            "-C",
+                            nixpkgs.to_str().unwrap(),
+                            "worktree",
+                            "add",
+                            base_path.to_str().unwrap(),
+                            &merge_base,
+                        ],
+                    )
+                    .await
+                    {
+                        warn!("Failed to create base worktree: {}", e);
+                    } else {
+                        *base_worktree_exists.lock().unwrap() = true;
+                    }
+                }
+
+                // Build same intermediate against base
+                if *base_worktree_exists.lock().unwrap() {
+                    info!(
+                        "Checking if {}.{} is a false positive (building against base)...",
+                        attr, intermediate_name
+                    );
+                    let (_, _, base_success, base_logs) = build_intermediate_async(
+                        base_path.clone(),
+                        attr.clone(),
+                        intermediate_name.clone(),
+                        system.to_string(),
+                        0, // pr_num=0 to avoid log collision
+                        true,
+                    )
+                    .await;
+
+                    // Save base build log with commit suffix
+                    let merge_base_short = &merge_base[..8.min(merge_base.len())];
+                    if let Err(e) = save_single_log(
+                        pr_num,
+                        &attr,
+                        &intermediate_name,
+                        &base_logs,
+                        Some(merge_base_short),
+                    ) {
+                        warn!("Failed to save base build log: {}", e);
+                    }
+
+                    // If base also fails, this is a false positive
+                    if !base_success {
+                        is_fp = true;
+                        info!(
+                            "{}.{} is a FALSE POSITIVE (also fails on base)",
+                            attr, intermediate_name
+                        );
+                    } else {
+                        info!(
+                            "{}.{} is a REAL FAILURE (passes on base)",
+                            attr, intermediate_name
+                        );
+                    }
+                }
+            }
+
             // Update results
             if let Some(result) = results.get_mut(&attr) {
                 result.intermediate_results.push((
@@ -479,6 +563,10 @@ pub async fn process_pr_full_eval(
                     success,
                     logs.clone(),
                 ));
+                // If this is a false positive, mark the package
+                if is_fp {
+                    result.is_false_positive = true;
+                }
             }
 
             // Update and save state
@@ -495,10 +583,11 @@ pub async fn process_pr_full_eval(
             }
 
             info!(
-                "Completed {}.{}: {}",
+                "Completed {}.{}: {}{}",
                 attr,
                 intermediate_name,
-                if success { "SUCCESS" } else { "FAILED" }
+                if success { "SUCCESS" } else { "FAILED" },
+                if is_fp { " (false positive)" } else { "" }
             );
         }
     }
@@ -598,7 +687,7 @@ pub async fn process_pr_full_eval(
         }
     }
 
-    // Cleanup PR worktree (base worktree already cleaned up or never created due to cache)
+    // Cleanup PR worktree
     let _ = run_command_async(
         "git",
         &[
@@ -611,6 +700,22 @@ pub async fn process_pr_full_eval(
         ],
     )
     .await;
+
+    // Cleanup base worktree if it was created for false positive checks
+    if *base_worktree_exists.lock().unwrap() {
+        let _ = run_command_async(
+            "git",
+            &[
+                "-C",
+                nixpkgs.to_str().unwrap(),
+                "worktree",
+                "remove",
+                "-f",
+                base_path.to_str().unwrap(),
+            ],
+        )
+        .await;
+    }
 
     // Combine previously completed results with new results
     let all_results: Vec<_> = {

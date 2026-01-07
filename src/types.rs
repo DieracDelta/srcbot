@@ -76,6 +76,9 @@ pub struct FullEvalBuildResult {
     pub intermediate_results: Vec<(String, bool, String)>, // (name, success, logs)
     pub package_success: bool,
     pub package_logs: String,
+    /// True if the failure also exists on the base branch (pre-existing failure)
+    #[serde(default)]
+    pub is_false_positive: bool,
 }
 
 /// Serializable version of ChangedPackage for state persistence
@@ -208,12 +211,42 @@ mod tests {
             ],
             package_success: false,
             package_logs: "failed".to_string(),
+            is_false_positive: false,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: FullEvalBuildResult = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.attr, "hello");
         assert_eq!(deserialized.intermediate_results.len(), 2);
         assert!(!deserialized.package_success);
+        assert!(!deserialized.is_false_positive);
+    }
+
+    #[test]
+    fn test_full_eval_build_result_false_positive() {
+        let result = FullEvalBuildResult {
+            attr: "broken-pkg".to_string(),
+            intermediate_results: vec![("src".to_string(), false, "404".to_string())],
+            package_success: false,
+            package_logs: "".to_string(),
+            is_false_positive: true,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: FullEvalBuildResult = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.is_false_positive);
+    }
+
+    #[test]
+    fn test_full_eval_build_result_backwards_compat() {
+        // Test that old serialized data without is_false_positive field works
+        let json = r#"{
+            "attr": "old-pkg",
+            "intermediate_results": [["src", true, "ok"]],
+            "package_success": true,
+            "package_logs": ""
+        }"#;
+        let deserialized: FullEvalBuildResult = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized.attr, "old-pkg");
+        assert!(!deserialized.is_false_positive); // defaults to false
     }
 
     #[test]

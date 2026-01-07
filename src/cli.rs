@@ -76,6 +76,12 @@ pub struct VerifyArgs {
     /// to verify FODs that were substituted.
     #[arg(long, default_value_t = false)]
     pub full_rebuild: bool,
+
+    /// When a build fails, check if it also fails on the base branch.
+    /// If so, mark it as a "false positive" (pre-existing failure) and show separately.
+    /// Only used with --full-eval.
+    #[arg(long, default_value_t = false)]
+    pub false_positive: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -218,8 +224,49 @@ mod tests {
             assert!(!verify_args.full_eval, "full_eval defaults to false");
             assert!(!verify_args.gist, "gist defaults to false");
             assert!(!verify_args.resume, "resume defaults to false");
+            assert!(
+                !verify_args.false_positive,
+                "false_positive defaults to false"
+            );
             assert_eq!(verify_args.system, "x86_64-linux");
             assert_eq!(verify_args.build_jobs, 4);
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_false_positive_flag_default_false() {
+        // Default (no flag) should be false
+        let args = Args::try_parse_from(["srcbot", "verify", "--prs", "12345"]).unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert!(
+                !verify_args.false_positive,
+                "--false-positive should default to false"
+            );
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_false_positive_flag_true_when_set() {
+        // --false-positive should be true when explicitly set
+        let args = Args::try_parse_from([
+            "srcbot",
+            "verify",
+            "--full-eval",
+            "--false-positive",
+            "--prs",
+            "12345",
+        ])
+        .unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert!(
+                verify_args.false_positive,
+                "--false-positive should be true when set"
+            );
+            assert!(verify_args.full_eval, "--full-eval should be true");
         } else {
             panic!("Expected Verify command");
         }

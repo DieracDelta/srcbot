@@ -51,7 +51,7 @@ I decided to add this, and it turns out that this causes all the src attributes 
 
 # I hate that you used claude code
 
-I'm not a fan of it either! But, undeniably I think this is something useful that allowed me to contribute somewhat impactfully to nixpkgs over my vacation. There were a LOT of mismatched hashes amongst different packages. And a lot of dead sources. This tool is able to both identify and automatically fix some of these. It's also hitting a niche that nixpkgs-review doesn't really hit which is "it's nontrivial to check intermediate attributes of a derivation"
+I'm not a fan of it either! But, undeniably I think this is something useful that allowed me to contribute somewhat productively to nixpkgs over my vacation a lot faster than I would have without it. There were a lot of mismatched hashes amongst different packages. And, a lot of dead sources. This tool is able to both identify and automatically fix some of these. It's also hitting a niche that I was really missing in nixpkgs-review which is "it's nontrivial to check intermediate attributes of a derivation"
 
 # Attribution
 

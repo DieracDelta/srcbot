@@ -23,6 +23,9 @@ cargo run --release --  --prs 473846 --full-eval --nixpkgs /home/jrestivo/dev/ni
 # fix a hash and push it to a branch
 # saving build logs to confirm it actually worked
 cargo run --release -- fix-hash  --save-location /srv/srcbot --nixpkgs /home/jrestivo/dev/nixpkgs --attribute invidtui --intermediate goModules --origin o2
+
+# iterate all intermediate attributes in python3Packages and ensure they build from source
+cargo run --release -- check-all python3Packages /home/jrestivo/dev/nixpkgs --limit 10
 ```
 
 # What does this implement

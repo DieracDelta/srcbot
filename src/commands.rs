@@ -1,4 +1,7 @@
 use anyhow::{anyhow, Context, Result};
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncBufReadExt;
@@ -101,14 +104,22 @@ pub enum NixCommandResult {
 /// - `cmd`: The command to run (e.g., "nix-build", "nix-eval-jobs")
 /// - `args`: Command arguments
 /// - `timeout_secs`: Maximum time to wait before killing the process
+/// - `prefix`: Optional prefix to prepend to each output line (e.g., "[pkg.src]")
+/// - `log_path`: Optional path to write logs to in real-time (each line flushed immediately)
 ///
 /// Returns a NixCommandResult indicating success, timeout, or failure.
 pub async fn run_nix_command_with_timeout(
     cmd: &str,
     args: &[&str],
     timeout_secs: u64,
+    prefix: Option<&str>,
+    log_path: Option<&Path>,
 ) -> NixCommandResult {
-    info!("$ {} {} (timeout: {}s)", cmd, args.join(" "), timeout_secs);
+    if let Some(p) = prefix {
+        info!("[{}] $ {} {} (timeout: {}s)", p, cmd, args.join(" "), timeout_secs);
+    } else {
+        info!("$ {} {} (timeout: {}s)", cmd, args.join(" "), timeout_secs);
+    }
 
     let child_result = TokioCommand::new(cmd)
         .args(args)
@@ -130,13 +141,52 @@ pub async fn run_nix_command_with_timeout(
 
     let output_log = Arc::new(Mutex::new(String::new()));
 
+    // Create log file if path provided
+    let log_file: Option<Arc<Mutex<File>>> = log_path.and_then(|p| {
+        // Ensure parent directory exists
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match File::create(p) {
+            Ok(f) => Some(Arc::new(Mutex::new(f))),
+            Err(e) => {
+                tracing::warn!("Failed to create log file {:?}: {}", p, e);
+                None
+            }
+        }
+    });
+
+    // Clone prefix and log_file for the spawned tasks
+    let stdout_prefix = prefix.map(|s| s.to_string());
+    let stderr_prefix = prefix.map(|s| s.to_string());
+    let stdout_log_file = log_file.clone();
+    let stderr_log_file = log_file.clone();
+
     let output_clone = output_log.clone();
     let stdout_task = tokio::spawn(async move {
         if let Some(stdout) = stdout {
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                println!("{}", line);
+                // Format line with prefix
+                let formatted = if let Some(ref p) = stdout_prefix {
+                    format!("[{}] {}", p, line)
+                } else {
+                    line.clone()
+                };
+
+                // Print to console
+                println!("{}", formatted);
+
+                // Write to log file immediately
+                if let Some(ref file) = stdout_log_file {
+                    if let Ok(mut f) = file.lock() {
+                        let _ = writeln!(f, "{}", formatted);
+                        let _ = f.flush();
+                    }
+                }
+
+                // Collect in memory
                 if let Ok(mut log) = output_clone.lock() {
                     log.push_str(&line);
                     log.push('\n');
@@ -151,7 +201,25 @@ pub async fn run_nix_command_with_timeout(
             let reader = tokio::io::BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("{}", line);
+                // Format line with prefix
+                let formatted = if let Some(ref p) = stderr_prefix {
+                    format!("[{}] {}", p, line)
+                } else {
+                    line.clone()
+                };
+
+                // Print to console
+                eprintln!("{}", formatted);
+
+                // Write to log file immediately
+                if let Some(ref file) = stderr_log_file {
+                    if let Ok(mut f) = file.lock() {
+                        let _ = writeln!(f, "{}", formatted);
+                        let _ = f.flush();
+                    }
+                }
+
+                // Collect in memory
                 if let Ok(mut log) = output_clone.lock() {
                     log.push_str(&line);
                     log.push('\n');
@@ -214,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_nix_command_with_timeout_success() {
-        let result = run_nix_command_with_timeout("echo", &["test output"], 10).await;
+        let result = run_nix_command_with_timeout("echo", &["test output"], 10, None, None).await;
         match result {
             NixCommandResult::Completed { code, logs } => {
                 assert_eq!(code, Some(0));
@@ -226,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_nix_command_with_timeout_exit_code() {
-        let result = run_nix_command_with_timeout("sh", &["-c", "exit 42"], 10).await;
+        let result = run_nix_command_with_timeout("sh", &["-c", "exit 42"], 10, None, None).await;
         match result {
             NixCommandResult::Completed { code, .. } => {
                 assert_eq!(code, Some(42));
@@ -237,7 +305,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_nix_command_with_timeout_captures_stderr() {
-        let result = run_nix_command_with_timeout("sh", &["-c", "echo error >&2"], 10).await;
+        let result =
+            run_nix_command_with_timeout("sh", &["-c", "echo error >&2"], 10, None, None).await;
         match result {
             NixCommandResult::Completed { code, logs } => {
                 assert_eq!(code, Some(0));
@@ -250,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_nix_command_with_timeout_times_out() {
         // Sleep for 5 seconds but timeout after 1
-        let result = run_nix_command_with_timeout("sleep", &["5"], 1).await;
+        let result = run_nix_command_with_timeout("sleep", &["5"], 1, None, None).await;
         match result {
             NixCommandResult::TimedOut { .. } => {
                 // Expected
@@ -262,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_nix_command_with_timeout_nonexistent_command() {
         let result =
-            run_nix_command_with_timeout("nonexistent_command_xyz_123", &[], 10).await;
+            run_nix_command_with_timeout("nonexistent_command_xyz_123", &[], 10, None, None).await;
         match result {
             NixCommandResult::Failed { error } => {
                 assert!(error.contains("Failed to spawn"));

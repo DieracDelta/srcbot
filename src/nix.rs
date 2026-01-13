@@ -604,6 +604,8 @@ pub async fn build_intermediate_async(
                     "nix-build",
                     &["--no-out-link", "--check", "--expr", &expr],
                     timeout_secs,
+                    Some(&full_attr),
+                    log_path.as_ref().map(|p| p.as_path()),
                 )
                 .await;
 

@@ -85,6 +85,8 @@ async fn gc_intermediate_store_path(
                 "nix-store",
                 &["--delete", store_path],
                 timeout_secs,
+                Some(&full_attr),
+                None, // No log file for delete operations
             )
             .await;
 
@@ -290,6 +292,8 @@ async fn build_intermediate(
                     "nix-build",
                     &["--no-out-link", "--check", "--expr", &expr],
                     timeout_secs,
+                    Some(&full_attr),
+                    Some(&log_path), // Stream to log file
                 )
                 .await;
 
@@ -459,6 +463,8 @@ async fn fetch_from_substituters(
         "nix-instantiate",
         &["--eval", "--expr", &path_expr],
         timeout_secs,
+        Some(&full_attr),
+        None, // Quick eval, no log file needed
     )
     .await;
 
@@ -503,6 +509,8 @@ async fn fetch_from_substituters(
         "nix-store",
         &["--realise", &store_path],
         timeout_secs,
+        Some(&full_attr),
+        None, // Fetching from substituters, no log file needed
     )
     .await;
 

@@ -17,7 +17,7 @@ use crate::nix::{
     build_intermediate_async, build_package_async, delete_store_paths_batch, get_attr_path,
     run_nix_eval_jobs,
 };
-use crate::summary::{build_intermediate_summary, build_summary_comment};
+use crate::summary::build_summary_comment;
 use crate::types::{
     ChangedPackage, ChangedPackageSer, FullEvalBuildResult, RunState, INTERMEDIATE_ATTRS,
 };
@@ -130,6 +130,7 @@ pub fn find_changed_packages(
 /// If `full_rebuild` is false (default), uses cache-friendly mode (allow cache, verify with --check).
 /// If `false_positive` is true, when a build fails, check if it also fails on the base branch.
 /// If `verify_full_drvs` is true, also detect packages where the final drvPath changed (not just intermediates).
+/// If `log_base_url` is provided, log URLs will be included in the summary.
 pub async fn process_pr_full_eval(
     pr_num: u64,
     token: Option<&String>,
@@ -144,6 +145,7 @@ pub async fn process_pr_full_eval(
     false_positive: bool,
     verify_full_drvs: bool,
     nix_timeout: u64,
+    log_base_url: Option<&str>,
 ) -> Result<bool> {
     info!("srcbot: Full evaluation mode for PR #{}", pr_num);
 
@@ -639,26 +641,6 @@ pub async fn process_pr_full_eval(
         }
     }
 
-    // Post intermediate results to GitHub (if not already posted)
-    if !intermediates_already_posted && !dry_run {
-        if let Some(token_str) = token {
-            let intermediate_summary = {
-                let state = run_state.lock().unwrap();
-                build_intermediate_summary(pr_num, &state.intermediate_results)
-            };
-            if let Err(e) = post_github_comment(pr_num, token_str, &intermediate_summary).await {
-                warn!("Failed to post intermediate results: {}", e);
-            } else {
-                info!("Posted intermediate results to PR #{}", pr_num);
-            }
-            // Mark as posted
-            if let Ok(mut state) = run_state.lock() {
-                state.intermediates_posted = true;
-                let _ = save_run_state(&state);
-            }
-        }
-    }
-
     // Build final packages (only if all intermediates succeeded)
     // Process one at a time to save state after each completion
     let packages_to_build: Vec<_> = results
@@ -692,7 +674,38 @@ pub async fn process_pr_full_eval(
             // Update result
             if let Some(result) = results.get_mut(&attr) {
                 result.package_success = success;
-                result.package_logs = logs;
+                result.package_logs = logs.clone();
+
+                // False positive check for package failures
+                if !success && false_positive && *base_worktree_exists.lock().unwrap() {
+                    info!(
+                        "Checking if {} package is a false positive (building against base)...",
+                        attr
+                    );
+
+                    let (_, base_success, base_logs) = build_package_async(
+                        base_path.clone(),
+                        attr.clone(),
+                        system.to_string(),
+                        0, // pr_num=0 to avoid log collision
+                    )
+                    .await;
+
+                    // Save base build log
+                    let merge_base_short = &merge_base[..8.min(merge_base.len())];
+                    if let Err(e) =
+                        save_single_log(pr_num, &attr, "package", &base_logs, Some(merge_base_short))
+                    {
+                        warn!("Failed to save base package log: {}", e);
+                    }
+
+                    if !base_success {
+                        result.is_false_positive = true;
+                        info!("{} package is a FALSE POSITIVE (also fails on base)", attr);
+                    } else {
+                        info!("{} package is a REAL FAILURE (passes on base)", attr);
+                    }
+                }
 
                 // Add to completed results and save state
                 let completed_result = result.clone();
@@ -705,9 +718,14 @@ pub async fn process_pr_full_eval(
                 }
 
                 info!(
-                    "Completed {}: {}",
+                    "Completed {}: {}{}",
                     attr,
-                    if success { "SUCCESS" } else { "FAILED" }
+                    if success { "SUCCESS" } else { "FAILED" },
+                    if result.is_false_positive {
+                        " (false positive)"
+                    } else {
+                        ""
+                    }
                 );
             }
         }
@@ -781,8 +799,17 @@ pub async fn process_pr_full_eval(
         warn!("Failed to delete run state: {}", e);
     }
 
+    // Build log URL base if log_base_url is provided
+    let log_url_base = log_base_url.map(|base| {
+        let log_dir_name = log_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        format!("{}/logs/{}", base, log_dir_name)
+    });
+
     // Build the summary for posting to PR
-    let summary = build_summary_comment(pr_num, &all_results);
+    let summary = build_summary_comment(pr_num, &all_results, log_url_base.as_deref());
 
     if !dry_run {
         if post_gist {

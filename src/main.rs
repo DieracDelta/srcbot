@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
                         verify_args.false_positive,
                         verify_args.verify_full_drvs,
                         verify_args.nix_timeout,
+                        verify_args.log_base_url.as_deref(),
                     )
                     .await
                 } else {

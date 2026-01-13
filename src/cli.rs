@@ -92,6 +92,12 @@ pub struct VerifyArgs {
     /// Operations that exceed this timeout will be cancelled and marked as failed.
     #[arg(long, default_value_t = 3600)]
     pub nix_timeout: u64,
+
+    /// Base URL for log files (e.g., "https://example.com/srcbot-srv")
+    /// When provided, log links will be added to the summary tables.
+    /// Only used with --full-eval.
+    #[arg(long)]
+    pub log_base_url: Option<String>,
 }
 
 #[derive(Parser, Debug)]

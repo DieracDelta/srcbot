@@ -235,6 +235,7 @@ pub async fn process_check_all(args: &CheckAllArgs) -> Result<bool> {
         let nixpkgs = nixpkgs_path.clone();
         let system = args.system.clone();
         let intermediate_str = intermediate.to_string();
+        let timeout_secs = args.nix_timeout;
 
         let mut stream = stream::iter(packages_with_intermediate.iter().map(|pkg| {
             let full_attr = if pkgset.is_empty() {
@@ -249,6 +250,7 @@ pub async fn process_check_all(args: &CheckAllArgs) -> Result<bool> {
                 system.clone(),
                 0, // No PR number for check-all
                 true,
+                timeout_secs,
             )
         }))
         .buffer_unordered(args.build_jobs);

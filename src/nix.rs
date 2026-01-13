@@ -273,18 +273,7 @@ async fn delete_store_paths_batch_once(
     let log_file = get_log_dir(pr_num)
         .map(|dir| dir.join("gc.log"))
         .ok()
-        .and_then(|p| {
-            // rename old log if exists
-            if p.exists() {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let backup = p.with_extension(format!("log.{}", timestamp));
-                let _ = std::fs::rename(&p, backup);
-            }
-            std::fs::File::create(p).ok()
-        });
+        .and_then(|p| std::fs::File::create(p).ok());
     let log_file = Arc::new(Mutex::new(log_file));
 
     // log the paths we're trying to delete (to file and console via tracing)
@@ -453,6 +442,9 @@ async fn delete_store_paths_batch_once(
 ///
 /// If `use_cache` is false, uses `--substituters ""` to force fresh fetch (full rebuild mode).
 /// If `use_cache` is true, allows cache and verifies with --check if the FOD was substituted.
+///
+/// The `timeout_secs` parameter specifies the maximum time to wait for nix operations
+/// before killing the process to prevent infinite hangs.
 pub async fn build_intermediate_async(
     nixpkgs_path: PathBuf,
     attr: String,
@@ -460,6 +452,7 @@ pub async fn build_intermediate_async(
     system: String,
     pr_num: u64,
     use_cache: bool,
+    timeout_secs: u64,
 ) -> (String, String, bool, String) {
     // (attr, intermediate, success, logs)
     let full_attr = format!("{}.{}", attr, intermediate);
@@ -495,19 +488,7 @@ pub async fn build_intermediate_async(
         })
         .ok();
 
-    // If log file exists, rename it to preserve partial logs from interrupted builds
-    if let Some(ref p) = log_path {
-        if p.exists() {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let backup = p.with_extension(format!("log.{}", timestamp));
-            let _ = std::fs::rename(p, backup);
-        }
-    }
-
-    // Open log file (fresh)
+    // Open log file (fresh) - each run uses a separate directory so no need to backup
     let log_file = log_path
         .as_ref()
         .and_then(|p| std::fs::File::create(p).ok());
@@ -617,37 +598,43 @@ pub async fn build_intermediate_async(
             if needs_check {
                 log_text.push_str("\n--- Running --check to verify FOD ---\n");
 
-                // Run --check to verify
-                let check_args = vec!["--no-out-link", "--check", "--expr", &expr];
-                match TokioCommand::new("nix-build")
-                    .args(&check_args)
-                    .output()
-                    .await
-                {
-                    Ok(output) => {
-                        let check_success = output.status.success();
-                        let check_stdout = String::from_utf8_lossy(&output.stdout);
-                        let check_stderr = String::from_utf8_lossy(&output.stderr);
-                        log_text.push_str(&check_stdout);
-                        log_text.push_str(&check_stderr);
+                // Run --check to verify with timeout to prevent infinite hangs
+                use crate::commands::{run_nix_command_with_timeout, NixCommandResult};
+                let check_result = run_nix_command_with_timeout(
+                    "nix-build",
+                    &["--no-out-link", "--check", "--expr", &expr],
+                    timeout_secs,
+                )
+                .await;
 
-                        // Write check logs to file
-                        if let Some(ref p) = log_path {
-                            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(p) {
-                                let _ = writeln!(file, "\n--- --check verification ---");
-                                let _ = write!(file, "{}", check_stdout);
-                                let _ = write!(file, "{}", check_stderr);
-                            }
-                        }
-
-                        if !check_success {
-                            return (attr, intermediate, false, log_text);
-                        }
-                    }
-                    Err(e) => {
-                        log_text.push_str(&format!("Failed to run --check: {}", e));
+                let (check_code, check_logs) = match check_result {
+                    NixCommandResult::Completed { code, logs } => (code, logs),
+                    NixCommandResult::TimedOut { logs } => {
+                        log_text.push_str(&logs);
+                        log_text.push_str(&format!(
+                            "\n--check verification timed out after {}s",
+                            timeout_secs
+                        ));
                         return (attr, intermediate, false, log_text);
                     }
+                    NixCommandResult::Failed { error } => {
+                        log_text.push_str(&format!("Failed to run --check: {}", error));
+                        return (attr, intermediate, false, log_text);
+                    }
+                };
+
+                // Write check logs to file
+                if let Some(ref p) = log_path {
+                    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(p) {
+                        let _ = writeln!(file, "\n--- --check verification ---");
+                        let _ = write!(file, "{}", check_logs);
+                    }
+                }
+
+                log_text.push_str(&check_logs);
+
+                if check_code != Some(0) {
+                    return (attr, intermediate, false, log_text);
                 }
             }
         }
@@ -681,19 +668,7 @@ pub async fn build_package_async(
         })
         .ok();
 
-    // If log file exists, rename it to preserve partial logs from interrupted builds
-    if let Some(ref p) = log_path {
-        if p.exists() {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let backup = p.with_extension(format!("log.{}", timestamp));
-            let _ = std::fs::rename(p, backup);
-        }
-    }
-
-    // Open log file (fresh)
+    // Open log file (fresh) - each run uses a separate directory so no need to backup
     let log_file = log_path
         .as_ref()
         .and_then(|p| std::fs::File::create(p).ok());

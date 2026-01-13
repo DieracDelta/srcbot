@@ -143,6 +143,7 @@ pub async fn process_pr_full_eval(
     full_rebuild: bool,
     false_positive: bool,
     verify_full_drvs: bool,
+    nix_timeout: u64,
 ) -> Result<bool> {
     info!("srcbot: Full evaluation mode for PR #{}", pr_num);
 
@@ -520,6 +521,7 @@ pub async fn process_pr_full_eval(
                 system.to_string(),
                 pr_num,
                 use_cache,
+                nix_timeout,
             )
         }))
         .buffer_unordered(build_jobs); // Use same parallelism as final builds
@@ -569,6 +571,7 @@ pub async fn process_pr_full_eval(
                         system.to_string(),
                         0, // pr_num=0 to avoid log collision
                         true,
+                        nix_timeout,
                     )
                     .await;
 

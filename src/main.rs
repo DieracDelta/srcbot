@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
                         verify_args.full_rebuild,
                         verify_args.false_positive,
                         verify_args.verify_full_drvs,
+                        verify_args.nix_timeout,
                     )
                     .await
                 } else {
@@ -113,6 +114,7 @@ async fn main() -> Result<()> {
                 fix_args.branch.as_ref(),
                 &fix_args.log_base_url,
                 fix_args.no_pr_text,
+                fix_args.nix_timeout,
             )
             .await
             {

@@ -58,7 +58,15 @@ fn parse_hash_mismatch(output: &str) -> Option<HashMismatch> {
 }
 
 /// Delete the store path for an intermediate attribute to force rebuild
-async fn gc_intermediate_store_path(nixpkgs_path: &PathBuf, attr: &str, intermediate: &str, system: &str) -> Result<()> {
+async fn gc_intermediate_store_path(
+    nixpkgs_path: &PathBuf,
+    attr: &str,
+    intermediate: &str,
+    system: &str,
+    timeout_secs: u64,
+) -> Result<()> {
+    use crate::commands::{run_nix_command_with_timeout, NixCommandResult};
+
     let full_attr = format!("{}.{}", attr, intermediate);
     let expr = format!(
         "with import {} {{ system = \"{}\"; config = {{ allowUnfree = true; }}; }}; {}.outPath",
@@ -73,21 +81,26 @@ async fn gc_intermediate_store_path(nixpkgs_path: &PathBuf, attr: &str, intermed
         let store_path = output.trim().trim_matches('"');
         if store_path.starts_with("/nix/store/") && std::path::Path::new(store_path).exists() {
             info!("Deleting store path to force rebuild: {}", store_path);
-            let delete_result = TokioCommand::new("nix-store")
-                .args(["--delete", store_path])
-                .output()
-                .await;
+            let delete_result = run_nix_command_with_timeout(
+                "nix-store",
+                &["--delete", store_path],
+                timeout_secs,
+            )
+            .await;
+
             match delete_result {
-                Ok(output) if output.status.success() => {
+                NixCommandResult::Completed { code, logs: _ } if code == Some(0) => {
                     info!("Successfully deleted {}", store_path);
                 }
-                Ok(output) => {
+                NixCommandResult::Completed { code: _, logs } => {
                     // Deletion might fail if path is still referenced, that's okay
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    warn!("Could not delete store path (may be in use): {}", stderr.trim());
+                    warn!("Could not delete store path (may be in use): {}", logs.trim());
                 }
-                Err(e) => {
-                    warn!("Failed to run nix-store --delete: {}", e);
+                NixCommandResult::TimedOut { .. } => {
+                    warn!("nix-store --delete timed out after {}s", timeout_secs);
+                }
+                NixCommandResult::Failed { error } => {
+                    warn!("Failed to run nix-store --delete: {}", error);
                 }
             }
         }
@@ -104,7 +117,9 @@ async fn build_intermediate(
     intermediate: &str,
     system: &str,
     log_suffix: &str,
+    timeout_secs: u64,
 ) -> Result<(bool, String, Option<String>)> {
+    use crate::commands::{run_nix_command_with_timeout, NixCommandResult};
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -271,35 +286,39 @@ async fn build_intermediate(
             if needs_check {
                 log_text.push_str("\n--- Running --check to verify FOD ---\n");
 
-                let check_args = vec!["--no-out-link", "--check", "--expr", &expr];
-                match TokioCommand::new("nix-build")
-                    .args(&check_args)
-                    .output()
-                    .await
-                {
-                    Ok(output) => {
-                        let check_success = output.status.success();
-                        let check_stdout = String::from_utf8_lossy(&output.stdout);
-                        let check_stderr = String::from_utf8_lossy(&output.stderr);
-                        log_text.push_str(&check_stdout);
-                        log_text.push_str(&check_stderr);
+                let check_result = run_nix_command_with_timeout(
+                    "nix-build",
+                    &["--no-out-link", "--check", "--expr", &expr],
+                    timeout_secs,
+                )
+                .await;
 
-                        // Write check logs to file
-                        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&log_path) {
-                            use std::io::Write;
-                            let _ = writeln!(file, "\n--- --check verification ---");
-                            let _ = write!(file, "{}", check_stdout);
-                            let _ = write!(file, "{}", check_stderr);
-                        }
-
-                        if !check_success {
-                            return Ok((false, log_text, final_store_path));
-                        }
-                    }
-                    Err(e) => {
-                        log_text.push_str(&format!("Failed to run --check: {}", e));
+                let (check_success, check_logs) = match check_result {
+                    NixCommandResult::Completed { code, logs } => (code == Some(0), logs),
+                    NixCommandResult::TimedOut { logs } => {
+                        log_text.push_str(&logs);
+                        log_text.push_str(&format!(
+                            "\n--check verification timed out after {}s",
+                            timeout_secs
+                        ));
                         return Ok((false, log_text, final_store_path));
                     }
+                    NixCommandResult::Failed { error } => {
+                        log_text.push_str(&format!("Failed to run --check: {}", error));
+                        return Ok((false, log_text, final_store_path));
+                    }
+                };
+
+                log_text.push_str(&check_logs);
+
+                // Write check logs to file
+                if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+                    let _ = writeln!(file, "\n--- --check verification ---");
+                    let _ = write!(file, "{}", check_logs);
+                }
+
+                if !check_success {
+                    return Ok((false, log_text, final_store_path));
                 }
             }
         }
@@ -417,7 +436,10 @@ async fn fetch_from_substituters(
     attr: &str,
     intermediate: &str,
     system: &str,
+    timeout_secs: u64,
 ) -> Result<Option<String>> {
+    use crate::commands::{run_nix_command_with_timeout, NixCommandResult};
+
     let full_attr = format!("{}.{}", attr, intermediate);
 
     // First, get the store path for the old hash
@@ -433,21 +455,30 @@ async fn fetch_from_substituters(
     info!("Running: {}", cmd_str);
     println!("$ {}", cmd_str);
 
-    let path_output = TokioCommand::new("nix-instantiate")
-        .args(["--eval", "--expr", &path_expr])
-        .output()
-        .await
-        .context("Failed to get store path")?;
+    let path_result = run_nix_command_with_timeout(
+        "nix-instantiate",
+        &["--eval", "--expr", &path_expr],
+        timeout_secs,
+    )
+    .await;
 
-    if !path_output.status.success() {
-        info!("Could not determine store path for old source");
-        return Ok(None);
-    }
-
-    let store_path = String::from_utf8_lossy(&path_output.stdout)
-        .trim()
-        .trim_matches('"')
-        .to_string();
+    let store_path = match path_result {
+        NixCommandResult::Completed { code, logs } if code == Some(0) => {
+            logs.trim().trim_matches('"').to_string()
+        }
+        NixCommandResult::Completed { .. } => {
+            info!("Could not determine store path for old source");
+            return Ok(None);
+        }
+        NixCommandResult::TimedOut { .. } => {
+            info!("nix-instantiate timed out while getting store path");
+            return Ok(None);
+        }
+        NixCommandResult::Failed { error } => {
+            info!("Failed to get store path: {}", error);
+            return Ok(None);
+        }
+    };
 
     if !store_path.starts_with("/nix/store/") {
         info!("Invalid store path: {}", store_path);
@@ -468,20 +499,31 @@ async fn fetch_from_substituters(
     info!("Running: {}", cmd_str);
     println!("$ {}", cmd_str);
 
-    let output = TokioCommand::new("nix-store")
-        .args(["--realise", &store_path])
-        .output()
-        .await
-        .context("Failed to run nix-store --realise")?;
+    let realise_result = run_nix_command_with_timeout(
+        "nix-store",
+        &["--realise", &store_path],
+        timeout_secs,
+    )
+    .await;
 
-    if output.status.success() {
-        info!("Fetched old source from cache: {}", store_path);
-        return Ok(Some(store_path));
+    match realise_result {
+        NixCommandResult::Completed { code, logs: _ } if code == Some(0) => {
+            info!("Fetched old source from cache: {}", store_path);
+            Ok(Some(store_path))
+        }
+        NixCommandResult::Completed { logs, .. } => {
+            info!("Could not fetch old source from substituters: {}", logs.trim());
+            Ok(None)
+        }
+        NixCommandResult::TimedOut { .. } => {
+            info!("nix-store --realise timed out while fetching from substituters");
+            Ok(None)
+        }
+        NixCommandResult::Failed { error } => {
+            info!("Failed to run nix-store --realise: {}", error);
+            Ok(None)
+        }
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    info!("Could not fetch old source from substituters: {}", stderr.trim());
-    Ok(None)
 }
 
 /// Generate PR text for a hash fix (nixpkgs format)
@@ -719,6 +761,7 @@ async fn process_fix_hash_worktree(
     branch: Option<&String>,
     log_base_url: &str,
     no_pr_text: bool,
+    nix_timeout: u64,
 ) -> Result<bool> {
     info!("==========================================");
     info!("Fix Hash Worktree: {} ({})", attribute, intermediate);
@@ -741,7 +784,7 @@ async fn process_fix_hash_worktree(
 
     // Step 1.5: GC the store path to force a fresh build
     info!("Step 1.5: Deleting local store path to force rebuild...");
-    gc_intermediate_store_path(nixpkgs_path, attribute, intermediate, system).await?;
+    gc_intermediate_store_path(nixpkgs_path, attribute, intermediate, system, nix_timeout).await?;
 
     // Step 2: Try to build the attribute (expect hash mismatch)
     info!("Step 2: Building {}.{} to detect hash mismatch...", attribute, intermediate);
@@ -752,6 +795,7 @@ async fn process_fix_hash_worktree(
         intermediate,
         system,
         "before",
+        nix_timeout,
     ).await?;
 
     if success {
@@ -771,7 +815,7 @@ async fn process_fix_hash_worktree(
 
     // Step 3.5: Try to fetch old source from substituters BEFORE updating the hash
     info!("Step 3.5: Trying to fetch old source from substituters...");
-    let old_source_path = fetch_from_substituters(nixpkgs_path, attribute, intermediate, system).await?;
+    let old_source_path = fetch_from_substituters(nixpkgs_path, attribute, intermediate, system, nix_timeout).await?;
 
     // Copy old source to logs if available
     let mut has_old_source = false;
@@ -834,6 +878,7 @@ async fn process_fix_hash_worktree(
         intermediate,
         system,
         "after",
+        nix_timeout,
     ).await?;
 
     if !rebuild_success {
@@ -996,6 +1041,7 @@ pub async fn process_fix_hash(
     branch: Option<&String>,
     log_base_url: &str,
     no_pr_text: bool,
+    nix_timeout: u64,
 ) -> Result<bool> {
     info!("==========================================");
     info!("Fix Hash: {} ({})", attribute, intermediate);
@@ -1072,6 +1118,7 @@ pub async fn process_fix_hash(
         branch,
         log_base_url,
         no_pr_text,
+        nix_timeout,
     ).await;
 
     // Check if we should preserve the temp dir on failure

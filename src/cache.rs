@@ -1,8 +1,9 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use tracing::{info, warn};
 
 use crate::full_eval_types::EvalJobOutput;
@@ -10,6 +11,9 @@ use crate::types::{FullEvalBuildResult, RunState};
 
 /// Global custom save location (set once at startup)
 static SAVE_LOCATION: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Cache for log directories per PR (to ensure same directory is used throughout a run)
+static LOG_DIR_CACHE: OnceLock<Mutex<HashMap<u64, PathBuf>>> = OnceLock::new();
 
 /// Initialize the global save location (again, only called once at startup)
 pub fn init_save_location(location: Option<PathBuf>) {
@@ -131,10 +135,45 @@ pub fn delete_run_state(pr_num: u64) -> Result<()> {
     Ok(())
 }
 
-/// Get the log directory for a PR, creating it if needed
+/// Get the log directory for a PR, creating it if needed.
+/// If logs/{pr_num} already exists with files, creates logs/{pr_num}_{i} for the lowest i available.
+/// The chosen directory is cached so subsequent calls in the same run return the same path.
 pub fn get_log_dir(pr_num: u64) -> Result<PathBuf> {
-    let log_dir = get_base_dir().join("logs").join(pr_num.to_string());
+    let cache = LOG_DIR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache_guard = cache.lock().unwrap();
+
+    // Return cached directory if we've already determined it this run
+    if let Some(cached) = cache_guard.get(&pr_num) {
+        return Ok(cached.clone());
+    }
+
+    let logs_base = get_base_dir().join("logs");
+    let base_dir = logs_base.join(pr_num.to_string());
+
+    // Check if base directory exists and has files
+    let dir_has_files = base_dir.exists() && fs::read_dir(&base_dir)?.next().is_some();
+
+    let log_dir = if dir_has_files {
+        // Find the lowest i such that logs/{pr_num}_{i} doesn't exist
+        let mut i = 1u32;
+        loop {
+            let candidate = logs_base.join(format!("{}_{}", pr_num, i));
+            if !candidate.exists() {
+                info!(
+                    "Log directory {} already has files, using {} instead",
+                    base_dir.display(),
+                    candidate.display()
+                );
+                break candidate;
+            }
+            i += 1;
+        }
+    } else {
+        base_dir
+    };
+
     fs::create_dir_all(&log_dir)?;
+    cache_guard.insert(pr_num, log_dir.clone());
     Ok(log_dir)
 }
 

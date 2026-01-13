@@ -87,6 +87,11 @@ pub struct VerifyArgs {
     /// Only used with --full-eval.
     #[arg(long, default_value_t = false)]
     pub verify_full_drvs: bool,
+
+    /// Timeout in seconds for nix operations (builds, evals, etc.).
+    /// Operations that exceed this timeout will be cancelled and marked as failed.
+    #[arg(long, default_value_t = 3600)]
+    pub nix_timeout: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -135,6 +140,11 @@ pub struct FixHashArgs {
     /// Skip printing PR text to stdout
     #[arg(long, default_value_t = false)]
     pub no_pr_text: bool,
+
+    /// Timeout in seconds for nix operations (builds, evals, etc.).
+    /// Operations that exceed this timeout will be cancelled and marked as failed.
+    #[arg(long, default_value_t = 3600)]
+    pub nix_timeout: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -164,6 +174,11 @@ pub struct CheckAllArgs {
     /// Maximum number of packages to build (useful for testing)
     #[arg(long)]
     pub limit: Option<usize>,
+
+    /// Timeout in seconds for nix operations (builds, evals, etc.).
+    /// Operations that exceed this timeout will be cancelled and marked as failed.
+    #[arg(long, default_value_t = 3600)]
+    pub nix_timeout: u64,
 }
 
 #[cfg(test)]

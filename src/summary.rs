@@ -6,11 +6,67 @@ fn build_log_url(log_url_base: &str, attr: &str, step: &str) -> String {
     format!("{}/{}.{}.log", log_url_base, attr_safe, step)
 }
 
+/// Build a base (before) log URL for an attribute and step
+fn build_base_log_url(log_url_base: &str, attr: &str, step: &str, base_commit_short: &str) -> String {
+    let attr_safe = attr.replace('.', "_").replace('/', "_");
+    format!("{}/{}.{}.base-{}.log", log_url_base, attr_safe, step, base_commit_short)
+}
+
+/// Build a formatted string of steps with links
+/// For failures (include_before_after=true): `src ([before](...), [after](...)), package ([before](...), [after](...))`
+/// For passed (include_before_after=false): `[src](...), [package](...)`
+fn build_steps_with_links(
+    result: &FullEvalBuildResult,
+    log_url_base: Option<&str>,
+    base_commit_short: Option<&str>,
+    include_before_after: bool,
+) -> String {
+    // Collect all steps: intermediates + package
+    let mut steps: Vec<&str> = result
+        .intermediate_results
+        .iter()
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    steps.push("package");
+
+    match (log_url_base, base_commit_short, include_before_after) {
+        (Some(base), Some(commit_short), true) => {
+            // Before/after format for failures
+            steps
+                .iter()
+                .map(|step| {
+                    let before_url = build_base_log_url(base, &result.attr, step, commit_short);
+                    let after_url = build_log_url(base, &result.attr, step);
+                    format!("{} ([before]({}), [after]({}))", step, before_url, after_url)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        (Some(base), _, false) => {
+            // Simple links for passed packages
+            steps
+                .iter()
+                .map(|step| {
+                    let url = build_log_url(base, &result.attr, step);
+                    format!("[{}]({})", step, url)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        _ => {
+            // No links - just step names
+            steps.join(", ")
+        }
+    }
+}
+
 /// Build the summary comment to post to the PR
 pub fn build_summary_comment(
     pr_num: u64,
     results: &[FullEvalBuildResult],
     log_url_base: Option<&str>,
+    base_commit: Option<&str>,
+    base_commit_short: Option<&str>,
 ) -> String {
     let passed: Vec<_> = results.iter().filter(|r| r.package_success).collect();
     // Real failures: failed AND not a false positive
@@ -47,29 +103,16 @@ pub fn build_summary_comment(
             real_failed.len()
         ));
 
-        if log_url_base.is_some() {
-            summary.push_str("| Package | Failed Step | Log |\n|---------|-------------|-----|\n");
-        } else {
-            summary.push_str("| Package | Failed Step |\n|---------|-------------|\n");
-        }
+        summary.push_str("| Package | Steps |\n|---------|-------|\n");
 
         for result in &real_failed {
-            let failed_step = result
-                .intermediate_results
-                .iter()
-                .find(|(_, success, _)| !success)
-                .map(|(name, _, _)| name.as_str())
-                .unwrap_or("package");
-
-            if let Some(base) = log_url_base {
-                let log_url = build_log_url(base, &result.attr, failed_step);
-                summary.push_str(&format!(
-                    "| {} | {} | [log]({}) |\n",
-                    result.attr, failed_step, log_url
-                ));
-            } else {
-                summary.push_str(&format!("| {} | {} |\n", result.attr, failed_step));
-            }
+            let steps = build_steps_with_links(
+                result,
+                log_url_base,
+                base_commit_short,
+                true, // include before/after for failures
+            );
+            summary.push_str(&format!("| {} | {} |\n", result.attr, steps));
         }
         summary.push_str("\n</details>\n\n");
     }
@@ -81,31 +124,26 @@ pub fn build_summary_comment(
             "Pre-existing Failures (false positives) - {} packages</summary>\n\n",
             false_positives.len()
         ));
-        summary.push_str("These packages also fail on the base branch.\n\n");
-
-        if log_url_base.is_some() {
-            summary.push_str("| Package | Failed Step | Log |\n|---------|-------------|-----|\n");
+        if let Some(commit) = base_commit {
+            let short_commit = &commit[..8.min(commit.len())];
+            summary.push_str(&format!(
+                "These packages also fail on the base branch (`{}`).\n\n",
+                short_commit
+            ));
         } else {
-            summary.push_str("| Package | Failed Step |\n|---------|-------------|\n");
+            summary.push_str("These packages also fail on the base branch.\n\n");
         }
 
-        for result in &false_positives {
-            let failed_step = result
-                .intermediate_results
-                .iter()
-                .find(|(_, success, _)| !success)
-                .map(|(name, _, _)| name.as_str())
-                .unwrap_or("package");
+        summary.push_str("| Package | Steps |\n|---------|-------|\n");
 
-            if let Some(base) = log_url_base {
-                let log_url = build_log_url(base, &result.attr, failed_step);
-                summary.push_str(&format!(
-                    "| {} | {} | [log]({}) |\n",
-                    result.attr, failed_step, log_url
-                ));
-            } else {
-                summary.push_str(&format!("| {} | {} |\n", result.attr, failed_step));
-            }
+        for result in &false_positives {
+            let steps = build_steps_with_links(
+                result,
+                log_url_base,
+                base_commit_short,
+                true, // include before/after for false positives
+            );
+            summary.push_str(&format!("| {} | {} |\n", result.attr, steps));
         }
         summary.push_str("\n</details>\n\n");
     }
@@ -115,13 +153,13 @@ pub fn build_summary_comment(
         summary.push_str(&format!("{} packages passed</summary>\n\n", passed.len()));
         summary.push_str("| Package | Steps Built |\n|---------|-------------|\n");
         for result in &passed {
-            let steps: Vec<_> = result
-                .intermediate_results
-                .iter()
-                .map(|(name, _, _)| name.as_str())
-                .chain(std::iter::once("package"))
-                .collect();
-            summary.push_str(&format!("| {} | {} |\n", result.attr, steps.join(", ")));
+            let steps = build_steps_with_links(
+                result,
+                log_url_base,
+                base_commit_short,
+                false, // no before/after for passed packages
+            );
+            summary.push_str(&format!("| {} | {} |\n", result.attr, steps));
         }
         summary.push_str("\n</details>\n");
     }
@@ -142,7 +180,7 @@ mod tests {
             package_logs: "".to_string(),
             is_false_positive: false,
         }];
-        let summary = build_summary_comment(123, &results, None);
+        let summary = build_summary_comment(123, &results, None, None, None);
         assert!(summary.contains("1/1 packages passed"));
         assert!(summary.contains("0 failed"));
         assert!(!summary.contains("pre-existing"));
@@ -157,7 +195,7 @@ mod tests {
             package_logs: "".to_string(),
             is_false_positive: false,
         }];
-        let summary = build_summary_comment(123, &results, None);
+        let summary = build_summary_comment(123, &results, None, None, None);
         assert!(summary.contains("0/1 packages passed"));
         assert!(summary.contains("1 failed"));
         assert!(summary.contains("introduced by this PR"));
@@ -174,12 +212,13 @@ mod tests {
             package_logs: "".to_string(),
             is_false_positive: true,
         }];
-        let summary = build_summary_comment(123, &results, None);
+        let summary = build_summary_comment(123, &results, None, Some("abc123def456"), None);
         assert!(summary.contains("0/1 packages passed"));
         assert!(summary.contains("1 failed"));
         assert!(summary.contains("1 pre-existing"));
         assert!(summary.contains("Pre-existing Failures"));
         assert!(summary.contains("prebroken"));
+        assert!(summary.contains("`abc123de`")); // Short commit in message
         // When there are only false positives, we shouldn't show the "introduced by this PR" section
         assert!(!summary.contains("introduced by this PR"));
     }
@@ -209,7 +248,7 @@ mod tests {
                 is_false_positive: true,
             },
         ];
-        let summary = build_summary_comment(123, &results, None);
+        let summary = build_summary_comment(123, &results, None, None, None);
         assert!(summary.contains("1/3 packages passed"));
         assert!(summary.contains("2 failed"));
         assert!(summary.contains("1 pre-existing"));
@@ -228,7 +267,37 @@ mod tests {
             package_logs: "".to_string(),
             is_false_positive: false,
         }];
-        let summary = build_summary_comment(123, &results, Some("https://example.com/logs/123"));
-        assert!(summary.contains("[log](https://example.com/logs/123/python3Packages_broken.src.log)"));
+        // With log_url_base and base_commit_short, we get before/after links
+        let summary = build_summary_comment(
+            123,
+            &results,
+            Some("https://example.com/logs/123"),
+            None,
+            Some("abc12345"),
+        );
+        // Check for the new before/after format
+        assert!(summary.contains("src ([before](https://example.com/logs/123/python3Packages_broken.src.base-abc12345.log), [after](https://example.com/logs/123/python3Packages_broken.src.log))"));
+        assert!(summary.contains("package ([before](https://example.com/logs/123/python3Packages_broken.package.base-abc12345.log), [after](https://example.com/logs/123/python3Packages_broken.package.log))"));
+    }
+
+    #[test]
+    fn test_build_summary_comment_passed_with_log_urls() {
+        let results = vec![FullEvalBuildResult {
+            attr: "hello".to_string(),
+            intermediate_results: vec![("src".to_string(), true, "ok".to_string())],
+            package_success: true,
+            package_logs: "".to_string(),
+            is_false_positive: false,
+        }];
+        // Passed packages get simple step links (no before/after)
+        let summary = build_summary_comment(
+            123,
+            &results,
+            Some("https://example.com/logs/123"),
+            None,
+            Some("abc12345"),
+        );
+        assert!(summary.contains("[src](https://example.com/logs/123/hello.src.log)"));
+        assert!(summary.contains("[package](https://example.com/logs/123/hello.package.log)"));
     }
 }

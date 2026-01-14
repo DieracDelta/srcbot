@@ -218,15 +218,10 @@ pub fn get_fix_hash_attr_log_dir(attr: &str) -> Result<PathBuf> {
     Ok(log_dir)
 }
 
-/// Save build logs locally to {base_dir}/logs/{pr_num}/
+/// Save build logs locally to the log directory for this PR
+/// Uses get_log_dir to ensure we save to the same directory where individual logs were saved
 pub fn save_logs_locally(pr_num: u64, results: &[FullEvalBuildResult]) -> Result<PathBuf> {
-    let log_dir = get_base_dir().join("logs").join(pr_num.to_string());
-
-    // Remove old logs if they exist
-    if log_dir.exists() {
-        fs::remove_dir_all(&log_dir)?;
-    }
-    fs::create_dir_all(&log_dir)?;
+    let log_dir = get_log_dir(pr_num)?;
 
     // Count successes and failures for summary
     let passed: Vec<_> = results.iter().filter(|r| r.package_success).collect();

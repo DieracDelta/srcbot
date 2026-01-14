@@ -143,6 +143,7 @@ pub async fn process_pr_full_eval(
     resume: bool,
     full_rebuild: bool,
     false_positive: bool,
+    base_commit_override: Option<&str>,
     verify_full_drvs: bool,
     nix_timeout: u64,
     log_base_url: Option<&str>,
@@ -182,6 +183,14 @@ pub async fn process_pr_full_eval(
     )
     .await?;
     info!("Merge-base (fork point): {}", merge_base);
+
+    // Use override if provided, otherwise use computed merge_base
+    let base_commit = if let Some(override_commit) = base_commit_override {
+        info!("Using override base commit: {}", override_commit);
+        override_commit.to_string()
+    } else {
+        merge_base.clone()
+    };
 
     // Check if saved state is valid (matches current PR state)
     let valid_saved_state = saved_state.as_ref().and_then(|state| {
@@ -252,11 +261,11 @@ pub async fn process_pr_full_eval(
     } else {
         // Fresh evaluation
         // Try to load cached base eval results, otherwise evaluate
-        let base_packages = if let Some(cached) = load_cached_eval(&merge_base, system) {
+        let base_packages = if let Some(cached) = load_cached_eval(&base_commit, system) {
             info!("Using cached base eval ({} packages)", cached.len());
             cached
         } else {
-            info!("Creating base worktree (merge-base) at {:?}", base_path);
+            info!("Creating base worktree ({}) at {:?}", base_commit, base_path);
             run_command_async(
                 "git",
                 &[
@@ -265,7 +274,7 @@ pub async fn process_pr_full_eval(
                     "worktree",
                     "add",
                     base_path.to_str().unwrap(),
-                    &merge_base,
+                    &base_commit,
                 ],
             )
             .await?;
@@ -277,7 +286,7 @@ pub async fn process_pr_full_eval(
             let packages = run_nix_eval_jobs(&base_path, system, eval_workers).await?;
 
             // Cache the results
-            if let Err(e) = save_eval_cache(&merge_base, system, &packages) {
+            if let Err(e) = save_eval_cache(&base_commit, system, &packages) {
                 warn!("Failed to save eval cache: {}", e);
             }
 
@@ -549,7 +558,7 @@ pub async fn process_pr_full_eval(
                             "worktree",
                             "add",
                             base_path.to_str().unwrap(),
-                            &merge_base,
+                            &base_commit,
                         ],
                     )
                     .await
@@ -578,13 +587,13 @@ pub async fn process_pr_full_eval(
                     .await;
 
                     // Save base build log with commit suffix
-                    let merge_base_short = &merge_base[..8.min(merge_base.len())];
+                    let base_commit_short = &base_commit[..8.min(base_commit.len())];
                     if let Err(e) = save_single_log(
                         pr_num,
                         &attr,
                         &intermediate_name,
                         &base_logs,
-                        Some(merge_base_short),
+                        Some(base_commit_short),
                     ) {
                         warn!("Failed to save base build log: {}", e);
                     }
@@ -692,9 +701,9 @@ pub async fn process_pr_full_eval(
                     .await;
 
                     // Save base build log
-                    let merge_base_short = &merge_base[..8.min(merge_base.len())];
+                    let base_commit_short = &base_commit[..8.min(base_commit.len())];
                     if let Err(e) =
-                        save_single_log(pr_num, &attr, "package", &base_logs, Some(merge_base_short))
+                        save_single_log(pr_num, &attr, "package", &base_logs, Some(base_commit_short))
                     {
                         warn!("Failed to save base package log: {}", e);
                     }
@@ -809,7 +818,14 @@ pub async fn process_pr_full_eval(
     });
 
     // Build the summary for posting to PR
-    let summary = build_summary_comment(pr_num, &all_results, log_url_base.as_deref());
+    let base_commit_short = &base_commit[..8.min(base_commit.len())];
+    let summary = build_summary_comment(
+        pr_num,
+        &all_results,
+        log_url_base.as_deref(),
+        Some(&base_commit),
+        Some(base_commit_short),
+    );
 
     if !dry_run {
         if post_gist {

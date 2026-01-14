@@ -83,6 +83,12 @@ pub struct VerifyArgs {
     #[arg(long, default_value_t = false)]
     pub false_positive: bool,
 
+    /// Override the base commit for false positive detection.
+    /// By default, uses the merge-base between the PR and the target branch.
+    /// Only used with --full-eval --false-positive.
+    #[arg(long)]
+    pub base_commit: Option<String>,
+
     /// Also detect and build packages where the final drvPath changed (not just intermediates).
     /// Only used with --full-eval.
     #[arg(long, default_value_t = false)]

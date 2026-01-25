@@ -692,6 +692,23 @@ pub async fn has_attr(nixpkgs_path: &PathBuf, pkg_attr: &str, sub_attr: &str, sy
     }
 }
 
+/// Check if a package attribute exists in nixpkgs (handles nested attrs like python3Packages.requests)
+pub async fn pkg_attr_exists(nixpkgs_path: &PathBuf, attr: &str, system: &str) -> bool {
+    // Use 'or null' to check if the attribute exists - this correctly handles missing attributes
+    // (builtins.tryEval doesn't catch attribute missing errors in lazy evaluation context)
+    let expr = format!(
+        "let pkgs = import {} {{ system = \"{}\"; }}; in if (pkgs.{} or null) == null then false else true",
+        nixpkgs_path.display(),
+        system,
+        attr
+    );
+
+    match run_command_async("nix-instantiate", &["--eval", "--expr", &expr]).await {
+        Ok(result) => result.trim() == "true",
+        Err(_) => false,
+    }
+}
+
 /// Get the store path for a package's sub-attribute
 pub async fn get_attr_path(
     nixpkgs_path: &PathBuf,

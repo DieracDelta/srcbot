@@ -1,6 +1,26 @@
 use crate::types::{FullEvalBuildResult, RemoteBuilderConfig};
 use std::collections::HashMap;
 
+/// Format a CLI command with line breaks for readability
+fn format_cli_command(cmd: &str) -> String {
+    // Split on " --" to get each flag
+    let parts: Vec<&str> = cmd.split(" --").collect();
+    if parts.len() <= 1 {
+        return cmd.to_string();
+    }
+
+    // First part is the command itself (e.g., "srcbot verify")
+    let mut formatted = parts[0].to_string();
+
+    // Add each flag on its own line with backslash continuation
+    for part in &parts[1..] {
+        formatted.push_str(" \\\n  --");
+        formatted.push_str(part);
+    }
+
+    formatted
+}
+
 /// Build a log URL for an attribute and step, including system prefix
 fn build_log_url(log_url_base: &str, system: &str, attr: &str, step: &str) -> String {
     let attr_safe = attr.replace('.', "_").replace('/', "_");
@@ -23,7 +43,10 @@ fn build_base_log_url(
 }
 
 /// Build a formatted string of steps with links
-/// For failures (include_before_after=true): `src ([before](...), [after](...)), package ([before](...), [after](...))`
+/// For failures (include_before_after=true):
+///   - Shows all steps with success/fail markers
+///   - If exists_on_base=true: `[src](...)` (passed), `package ([before](...), [after](...))` (failed)
+///   - If exists_on_base=false (new package): `[src](...)` (passed), `[package](...)` (failed)
 /// For passed (include_before_after=false): `[src](...), [package](...)`
 fn build_steps_with_links(
     result: &FullEvalBuildResult,
@@ -31,13 +54,13 @@ fn build_steps_with_links(
     base_commit_short: Option<&str>,
     include_before_after: bool,
 ) -> String {
-    // Collect all steps: intermediates + package
-    let mut steps: Vec<&str> = result
+    // Collect steps with their success status
+    let mut steps: Vec<(&str, bool)> = result
         .intermediate_results
         .iter()
-        .map(|(name, _, _)| name.as_str())
+        .map(|(name, success, _)| (name.as_str(), *success))
         .collect();
-    steps.push("package");
+    steps.push(("package", result.package_success));
 
     // Use result's system for log URLs, default to x86_64-linux if not set
     let system = if result.system.is_empty() {
@@ -46,24 +69,49 @@ fn build_steps_with_links(
         &result.system
     };
 
-    match (log_url_base, base_commit_short, include_before_after) {
-        (Some(base), Some(commit_short), true) => {
-            // Before/after format for failures
+    // Only show "before" links if the package exists on base (not a new package)
+    let show_before = include_before_after && result.exists_on_base;
+
+    match (log_url_base, base_commit_short, show_before) {
+        (Some(base), Some(commit_short), true) if include_before_after => {
+            // Failed package with base comparison available
+            // Show before/after for failed steps, label for passed steps
             steps
                 .iter()
-                .map(|step| {
-                    let before_url = build_base_log_url(base, system, &result.attr, step, commit_short);
+                .map(|(step, success)| {
                     let after_url = build_log_url(base, system, &result.attr, step);
-                    format!("{} ([before]({}), [after]({}))", step, before_url, after_url)
+                    if *success {
+                        // Passed step - labeled with simple link
+                        format!("{} (passed): [log]({})", step, after_url)
+                    } else {
+                        // Failed step - before/after links
+                        let before_url = build_base_log_url(base, system, &result.attr, step, commit_short);
+                        format!("{} (failed): [before]({}), [after]({})", step, before_url, after_url)
+                    }
                 })
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(" · ")
         }
-        (Some(base), _, false) => {
-            // Simple links for passed packages
+        (Some(base), _, _) if include_before_after => {
+            // Failed package but no base comparison (new package)
             steps
                 .iter()
-                .map(|step| {
+                .map(|(step, success)| {
+                    let url = build_log_url(base, system, &result.attr, step);
+                    if *success {
+                        format!("{} (passed): [log]({})", step, url)
+                    } else {
+                        format!("{} (failed): [log]({})", step, url)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        }
+        (Some(base), _, _) => {
+            // Passed packages - simple links, no labels needed
+            steps
+                .iter()
+                .map(|(step, _)| {
                     let url = build_log_url(base, system, &result.attr, step);
                     format!("[{}]({})", step, url)
                 })
@@ -72,7 +120,11 @@ fn build_steps_with_links(
         }
         _ => {
             // No links - just step names
-            steps.join(", ")
+            steps
+                .iter()
+                .map(|(step, _)| *step)
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     }
 }
@@ -162,7 +214,7 @@ pub fn build_summary_comment(
     if let Some(cmd) = cli_command {
         if !cmd.is_empty() {
             summary.push_str("\n<details>\n<summary>Command</summary>\n\n```bash\n");
-            summary.push_str(cmd);
+            summary.push_str(&format_cli_command(cmd));
             summary.push_str("\n```\n</details>\n");
         }
     }
@@ -311,6 +363,7 @@ mod tests {
             package_logs: "".to_string(),
             is_false_positive: false,
             is_non_deterministic: false,
+            exists_on_base: true,
         }];
         let summary = build_summary_comment(123, &results, None, None, None, None, None, None);
         assert!(summary.contains("1/1 packages passed"));
@@ -328,6 +381,7 @@ mod tests {
             package_logs: "".to_string(),
             is_false_positive: false,
             is_non_deterministic: false,
+            exists_on_base: true,
         }];
         let summary = build_summary_comment(123, &results, None, None, None, None, None, None);
         assert!(summary.contains("0/1 packages passed"));
@@ -347,6 +401,7 @@ mod tests {
             package_logs: "".to_string(),
             is_false_positive: true,
             is_non_deterministic: false,
+            exists_on_base: true,
         }];
         let summary = build_summary_comment(123, &results, None, Some("abc123def456"), None, None, None, None);
         assert!(summary.contains("0/1 packages passed"));
@@ -370,6 +425,7 @@ mod tests {
                 package_logs: "".to_string(),
                 is_false_positive: false,
                 is_non_deterministic: false,
+                exists_on_base: true,
             },
             FullEvalBuildResult {
                 attr: "real-fail".to_string(),
@@ -379,6 +435,7 @@ mod tests {
                 package_logs: "".to_string(),
                 is_false_positive: false,
                 is_non_deterministic: false,
+                exists_on_base: true,
             },
             FullEvalBuildResult {
                 attr: "false-positive".to_string(),
@@ -388,6 +445,7 @@ mod tests {
                 package_logs: "".to_string(),
                 is_false_positive: true,
                 is_non_deterministic: false,
+                exists_on_base: true,
             },
         ];
         let summary = build_summary_comment(123, &results, None, None, None, None, None, None);
@@ -410,8 +468,9 @@ mod tests {
             package_logs: "".to_string(),
             is_false_positive: false,
             is_non_deterministic: false,
+            exists_on_base: true,
         }];
-        // With log_url_base and base_commit_short, we get before/after links with system prefix
+        // With log_url_base and base_commit_short, we get labeled before/after links
         let summary = build_summary_comment(
             123,
             &results,
@@ -422,9 +481,9 @@ mod tests {
             None,
             None,
         );
-        // Check for the new before/after format with system prefix
-        assert!(summary.contains("src ([before](https://example.com/logs/123/x86_64-linux.python3Packages_broken.src.base-abc12345.log), [after](https://example.com/logs/123/x86_64-linux.python3Packages_broken.src.log))"));
-        assert!(summary.contains("package ([before](https://example.com/logs/123/x86_64-linux.python3Packages_broken.package.base-abc12345.log), [after](https://example.com/logs/123/x86_64-linux.python3Packages_broken.package.log))"));
+        // Check for the labeled format with before/after links for failed steps
+        assert!(summary.contains("src (failed): [before](https://example.com/logs/123/x86_64-linux.python3Packages_broken.src.base-abc12345.log), [after](https://example.com/logs/123/x86_64-linux.python3Packages_broken.src.log)"));
+        assert!(summary.contains("package (failed): [before](https://example.com/logs/123/x86_64-linux.python3Packages_broken.package.base-abc12345.log), [after](https://example.com/logs/123/x86_64-linux.python3Packages_broken.package.log)"));
     }
 
     #[test]
@@ -437,6 +496,7 @@ mod tests {
             package_logs: "".to_string(),
             is_false_positive: false,
             is_non_deterministic: false,
+            exists_on_base: true,
         }];
         // Passed packages get simple step links (no before/after) with system prefix
         let summary = build_summary_comment(
@@ -463,6 +523,7 @@ mod tests {
             package_logs: "".to_string(),
             is_false_positive: false,
             is_non_deterministic: false,
+            exists_on_base: true,
         }];
         let cli_cmd = "srcbot verify --full-eval --prs 12345 --remote-builder root@host --remote-system aarch64-linux";
         let summary = build_summary_comment(123, &results, None, None, None, None, Some(cli_cmd), None);
@@ -470,7 +531,13 @@ mod tests {
         assert!(summary.contains("<details>"));
         assert!(summary.contains("<summary>Command</summary>"));
         assert!(summary.contains("```bash"));
-        assert!(summary.contains(cli_cmd));
+        // Command is now formatted with line breaks
+        assert!(summary.contains("srcbot verify"));
+        assert!(summary.contains("--full-eval"));
+        assert!(summary.contains("--prs 12345"));
+        assert!(summary.contains("--remote-builder root@host"));
+        assert!(summary.contains("--remote-system aarch64-linux"));
+        assert!(summary.contains("\\\n")); // Line continuation
         assert!(summary.contains("</details>"));
     }
 
@@ -492,6 +559,7 @@ mod tests {
                 package_logs: "".to_string(),
                 is_false_positive: false,
                 is_non_deterministic: false,
+                exists_on_base: true,
             },
             FullEvalBuildResult {
                 attr: "hello".to_string(),
@@ -501,6 +569,7 @@ mod tests {
                 package_logs: "".to_string(),
                 is_false_positive: false,
                 is_non_deterministic: false,
+                exists_on_base: true,
             },
         ];
         let summary = build_summary_comment(123, &results, None, None, None, None, None, Some(&remote_config));

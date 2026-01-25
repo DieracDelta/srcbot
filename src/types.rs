@@ -88,6 +88,14 @@ pub struct FullEvalBuildResult {
     /// True if any intermediate or final build was non-deterministic (hash mismatch on --check)
     #[serde(default)]
     pub is_non_deterministic: bool,
+    /// True if the package exists on the base branch (false for new packages)
+    /// Used to determine whether to show "before" links in summaries
+    #[serde(default = "default_exists_on_base")]
+    pub exists_on_base: bool,
+}
+
+fn default_exists_on_base() -> bool {
+    true // Default to true for backwards compatibility with old cached data
 }
 
 /// Serializable version of ChangedPackage for state persistence
@@ -259,6 +267,7 @@ mod tests {
             package_logs: "failed".to_string(),
             is_false_positive: false,
             is_non_deterministic: false,
+            exists_on_base: true,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: FullEvalBuildResult = serde_json::from_str(&json).unwrap();
@@ -268,6 +277,7 @@ mod tests {
         assert!(!deserialized.package_success);
         assert!(!deserialized.is_false_positive);
         assert!(!deserialized.is_non_deterministic);
+        assert!(deserialized.exists_on_base);
     }
 
     #[test]
@@ -280,15 +290,17 @@ mod tests {
             package_logs: "".to_string(),
             is_false_positive: true,
             is_non_deterministic: false,
+            exists_on_base: true,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: FullEvalBuildResult = serde_json::from_str(&json).unwrap();
         assert!(deserialized.is_false_positive);
+        assert!(deserialized.exists_on_base);
     }
 
     #[test]
     fn test_full_eval_build_result_backwards_compat() {
-        // Test that old serialized data without is_false_positive field works
+        // Test that old serialized data without is_false_positive/exists_on_base fields works
         let json = r#"{
             "attr": "old-pkg",
             "intermediate_results": [["src", true, "ok"]],
@@ -298,6 +310,7 @@ mod tests {
         let deserialized: FullEvalBuildResult = serde_json::from_str(json).unwrap();
         assert_eq!(deserialized.attr, "old-pkg");
         assert!(!deserialized.is_false_positive); // defaults to false
+        assert!(deserialized.exists_on_base); // defaults to true for backwards compat
     }
 
     #[test]

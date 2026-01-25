@@ -13,7 +13,7 @@ use crate::commands::run_command_async;
 use crate::full_eval_types::EvalJobOutput;
 use crate::git::fetch_pr_ref;
 use crate::github::{create_gist_and_comment, fetch_pr_info, post_github_comment};
-use crate::nix::{build_intermediate_async, build_package_async, run_nix_eval_jobs};
+use crate::nix::{build_intermediate_async, build_package_async, pkg_attr_exists, run_nix_eval_jobs};
 use crate::summary::build_summary_comment;
 use crate::types::{
     ChangedPackage, ChangedPackageSer, FullEvalBuildResult, RemoteBuilderConfig, RunState,
@@ -294,6 +294,7 @@ async fn build_packages_for_system(
                     package_logs: String::new(),
                     is_false_positive: false,
                     is_non_deterministic: false,
+                    exists_on_base: true, // Will be set to false if detected as new package
                 },
             )
         })
@@ -410,40 +411,55 @@ async fn build_packages_for_system(
                 }
 
                 if *base_worktree_exists.lock().unwrap() {
-                    info!(
-                        "[{}] Checking if {}.{} is a false positive...",
-                        system, attr, intermediate_name
-                    );
-                    let (_, _, base_success, base_logs, _) = build_intermediate_async(
-                        base_path.clone(),
-                        attr.clone(),
-                        intermediate_name.clone(),
-                        system.clone(),
-                        0,
-                        true,
-                        nix_timeout,
-                        None, // Base builds always local
-                    )
-                    .await;
+                    // First check if the attribute exists on the base branch
+                    let attr_exists_on_base =
+                        pkg_attr_exists(&base_path, &attr, &system).await;
 
-                    let base_commit_short = &base_commit[..8.min(base_commit.len())];
-                    if let Err(e) = save_single_log(
-                        pr_num,
-                        &attr,
-                        &intermediate_name,
-                        &base_logs,
-                        Some(base_commit_short),
-                        Some(&system),
-                    ) {
-                        warn!("Failed to save base build log: {}", e);
-                    }
-
-                    if !base_success {
-                        is_fp = true;
+                    if !attr_exists_on_base {
                         info!(
-                            "[{}] {}.{} is a FALSE POSITIVE (also fails on base)",
+                            "[{}] {}.{} is a NEW package (doesn't exist on base), not a false positive",
                             system, attr, intermediate_name
                         );
+                        // Mark as new package so summary doesn't show "before" links
+                        if let Some(result) = results.get_mut(&attr) {
+                            result.exists_on_base = false;
+                        }
+                    } else {
+                        info!(
+                            "[{}] Checking if {}.{} is a false positive...",
+                            system, attr, intermediate_name
+                        );
+                        let (_, _, base_success, base_logs, _) = build_intermediate_async(
+                            base_path.clone(),
+                            attr.clone(),
+                            intermediate_name.clone(),
+                            system.clone(),
+                            0,
+                            true,
+                            nix_timeout,
+                            None, // Base builds always local
+                        )
+                        .await;
+
+                        let base_commit_short = &base_commit[..8.min(base_commit.len())];
+                        if let Err(e) = save_single_log(
+                            pr_num,
+                            &attr,
+                            &intermediate_name,
+                            &base_logs,
+                            Some(base_commit_short),
+                            Some(&system),
+                        ) {
+                            warn!("Failed to save base build log: {}", e);
+                        }
+
+                        if !base_success {
+                            is_fp = true;
+                            info!(
+                                "[{}] {}.{} is a FALSE POSITIVE (also fails on base)",
+                                system, attr, intermediate_name
+                            );
+                        }
                     }
                 }
             }
@@ -510,38 +526,51 @@ async fn build_packages_for_system(
 
                 // False positive check for package failures
                 if !success && false_positive && *base_worktree_exists.lock().unwrap() {
-                    info!(
-                        "[{}] Checking if {} package is a false positive...",
-                        system, attr
-                    );
+                    // First check if the attribute exists on the base branch
+                    let attr_exists_on_base =
+                        pkg_attr_exists(&base_path, &attr, &system).await;
 
-                    let (_, base_success, base_logs) = build_package_async(
-                        base_path.clone(),
-                        attr.clone(),
-                        system.clone(),
-                        0,
-                        None,
-                    )
-                    .await;
-
-                    let base_commit_short = &base_commit[..8.min(base_commit.len())];
-                    if let Err(e) = save_single_log(
-                        pr_num,
-                        &attr,
-                        "package",
-                        &base_logs,
-                        Some(base_commit_short),
-                        Some(&system),
-                    ) {
-                        warn!("Failed to save base package log: {}", e);
-                    }
-
-                    if !base_success {
-                        result.is_false_positive = true;
+                    if !attr_exists_on_base {
                         info!(
-                            "[{}] {} package is a FALSE POSITIVE (also fails on base)",
+                            "[{}] {} is a NEW package (doesn't exist on base), not a false positive",
                             system, attr
                         );
+                        // Mark as new package so summary doesn't show "before" links
+                        result.exists_on_base = false;
+                    } else {
+                        info!(
+                            "[{}] Checking if {} package is a false positive...",
+                            system, attr
+                        );
+
+                        let (_, base_success, base_logs) = build_package_async(
+                            base_path.clone(),
+                            attr.clone(),
+                            system.clone(),
+                            0,
+                            None,
+                        )
+                        .await;
+
+                        let base_commit_short = &base_commit[..8.min(base_commit.len())];
+                        if let Err(e) = save_single_log(
+                            pr_num,
+                            &attr,
+                            "package",
+                            &base_logs,
+                            Some(base_commit_short),
+                            Some(&system),
+                        ) {
+                            warn!("Failed to save base package log: {}", e);
+                        }
+
+                        if !base_success {
+                            result.is_false_positive = true;
+                            info!(
+                                "[{}] {} package is a FALSE POSITIVE (also fails on base)",
+                                system, attr
+                            );
+                        }
                     }
                 }
 
@@ -814,6 +843,32 @@ pub async fn process_pr_full_eval(
                 ],
             )
             .await;
+        }
+
+        // Create base worktree for false positive checks if needed and not already created
+        // (eval cache is separate from needing the worktree for false positive builds)
+        if false_positive && !base_worktree_created && all_changed.values().any(|v| !v.is_empty()) {
+            info!(
+                "Creating base worktree for false positive checks ({}) at {:?}",
+                base_commit, base_path
+            );
+            if let Err(e) = run_command_async(
+                "git",
+                &[
+                    "-C",
+                    nixpkgs.to_str().unwrap(),
+                    "worktree",
+                    "add",
+                    base_path.to_str().unwrap(),
+                    &base_commit,
+                ],
+            )
+            .await
+            {
+                warn!("Failed to create base worktree for false positive checks: {}", e);
+            } else {
+                *base_worktree_exists.lock().unwrap() = true;
+            }
         }
 
         (all_changed, Vec::new(), HashMap::new(), false)

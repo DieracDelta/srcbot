@@ -255,18 +255,23 @@ pub fn build_summary_comment(
             summary.push_str(&format!("### {}{}\n\n", system, system_suffix));
         }
 
-        let passed: Vec<_> = system_results
+        let mut passed: Vec<_> = system_results
             .iter()
             .filter(|r| r.package_success)
             .collect();
-        let real_failed: Vec<_> = system_results
+        passed.sort_by(|a, b| a.attr.cmp(&b.attr));
+
+        let mut real_failed: Vec<_> = system_results
             .iter()
             .filter(|r| !r.package_success && !r.is_false_positive)
             .collect();
-        let false_positives: Vec<_> = system_results
+        real_failed.sort_by(|a, b| a.attr.cmp(&b.attr));
+
+        let mut false_positives: Vec<_> = system_results
             .iter()
             .filter(|r| !r.package_success && r.is_false_positive)
             .collect();
+        false_positives.sort_by(|a, b| a.attr.cmp(&b.attr));
 
         // Show real failures first (introduced by this PR)
         if !real_failed.is_empty() {

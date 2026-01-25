@@ -14,18 +14,22 @@ mod types;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use cache::init_save_location;
+use cache::{init_save_location, save_command_file};
 use check_all::process_check_all;
 use cli::{Args, Commands};
 use fix_hash::process_fix_hash;
 use full_eval::process_pr_full_eval;
 use github::get_github_token;
 use simple::process_pr;
+use types::RemoteBuilderConfig;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Capture the CLI command for logging/summary before parsing
+    let cli_command = std::env::args().collect::<Vec<_>>().join(" ");
+
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
@@ -39,11 +43,54 @@ async fn main() -> Result<()> {
                 verify_args.token = get_github_token().await;
             }
 
+            // Validate and build remote builder config
+            let remote_config = match (&verify_args.remote_builder, &verify_args.remote_system) {
+                (Some(builder), Some(system)) => {
+                    info!(
+                        "Remote builder configured: {} for {}",
+                        builder, system
+                    );
+                    Some(RemoteBuilderConfig {
+                        ssh_target: builder.clone(),
+                        system: system.clone(),
+                        max_jobs: verify_args.remote_build_jobs,
+                        gc_threshold: verify_args.remote_gc_threshold.clone(),
+                        gc_keep_days: verify_args.remote_gc_keep_days,
+                    })
+                }
+                (None, None) => None,
+                _ => {
+                    error!("--remote-builder and --remote-system must both be specified together");
+                    std::process::exit(1);
+                }
+            };
+
+            // Log the remote builder info if configured
+            if let Some(ref config) = remote_config {
+                info!("  Builders arg: {}", config.to_builders_arg());
+                if let Some(ref threshold) = config.gc_threshold {
+                    info!("  GC threshold: {}", threshold);
+                }
+                if let Some(days) = config.gc_keep_days {
+                    info!("  GC keep days: {}", days);
+                }
+                // Note: Full multi-arch support is not yet implemented
+                warn!("Note: Multi-arch build orchestration is in development. Remote builder config is saved but not fully utilized yet.");
+            }
+
+            // Log the CLI command
+            info!("Command: {}", cli_command);
+
             let mut overall_success = true;
             for pr in &verify_args.prs {
                 info!("==========================================");
                 info!("Processing PR #{}", pr);
                 info!("==========================================");
+
+                // Save COMMAND.md to the log directory
+                if let Err(e) = save_command_file(*pr, &cli_command) {
+                    warn!("Failed to save command file: {}", e);
+                }
 
                 let result = if verify_args.full_eval {
                     // Full evaluation mode: detect all changed packages
@@ -63,6 +110,8 @@ async fn main() -> Result<()> {
                         verify_args.verify_full_drvs,
                         verify_args.nix_timeout,
                         verify_args.log_base_url.as_deref(),
+                        remote_config.as_ref(),
+                        &cli_command,
                     )
                     .await
                 } else {
@@ -75,6 +124,7 @@ async fn main() -> Result<()> {
                         &verify_args.system,
                         verify_args.dry_run,
                         verify_args.full_rebuild,
+                        remote_config.as_ref(),
                     )
                     .await
                 };
@@ -104,6 +154,28 @@ async fn main() -> Result<()> {
         }
 
         Commands::FixHash(fix_args) => {
+            // Build remote config if specified
+            let remote_config = match (&fix_args.remote_builder, &fix_args.remote_system) {
+                (Some(builder), Some(system)) => {
+                    info!(
+                        "Remote builder configured for fix-hash: {} for {}",
+                        builder, system
+                    );
+                    Some(RemoteBuilderConfig {
+                        ssh_target: builder.clone(),
+                        system: system.clone(),
+                        max_jobs: fix_args.remote_build_jobs,
+                        gc_threshold: None,
+                        gc_keep_days: None,
+                    })
+                }
+                (None, None) => None,
+                _ => {
+                    error!("--remote-builder and --remote-system must both be specified together");
+                    std::process::exit(1);
+                }
+            };
+
             match process_fix_hash(
                 &fix_args.nixpkgs,
                 &fix_args.attribute,
@@ -117,6 +189,7 @@ async fn main() -> Result<()> {
                 &fix_args.log_base_url,
                 fix_args.no_pr_text,
                 fix_args.nix_timeout,
+                remote_config.as_ref(),
             )
             .await
             {
@@ -137,7 +210,29 @@ async fn main() -> Result<()> {
         }
 
         Commands::CheckAll(check_args) => {
-            match process_check_all(&check_args).await {
+            // Build remote config if specified
+            let remote_config = match (&check_args.remote_builder, &check_args.remote_system) {
+                (Some(builder), Some(system)) => {
+                    info!(
+                        "Remote builder configured for check-all: {} for {}",
+                        builder, system
+                    );
+                    Some(RemoteBuilderConfig {
+                        ssh_target: builder.clone(),
+                        system: system.clone(),
+                        max_jobs: check_args.remote_build_jobs,
+                        gc_threshold: check_args.remote_gc_threshold.clone(),
+                        gc_keep_days: check_args.remote_gc_keep_days,
+                    })
+                }
+                (None, None) => None,
+                _ => {
+                    error!("--remote-builder and --remote-system must both be specified together");
+                    std::process::exit(1);
+                }
+            };
+
+            match process_check_all(&check_args, remote_config.as_ref()).await {
                 Ok(success) => {
                     if success {
                         info!("All checks passed");

@@ -10,7 +10,7 @@ use crate::nix::{
     build_attr_cache_friendly, build_package, delete_store_path, get_attr_path,
     prune_and_build_attr,
 };
-use crate::types::{AttrBuildResult, INTERMEDIATE_ATTRS};
+use crate::types::{AttrBuildResult, RemoteBuilderConfig, INTERMEDIATE_ATTRS};
 
 /// Process a single PR in simple mode (single attribute)
 ///
@@ -24,6 +24,7 @@ pub async fn process_pr(
     system: &str,
     dry_run: bool,
     full_rebuild: bool,
+    remote_config: Option<&RemoteBuilderConfig>,
 ) -> Result<bool> {
     info!("srcbot: Verifying source for PR #{}", pr_num);
     info!("Fetching PR info from: https://api.github.com/repos/NixOS/nixpkgs/pulls/{}", pr_num);
@@ -86,6 +87,10 @@ pub async fn process_pr(
     let mut intermediate_results: Vec<AttrBuildResult> = Vec::new();
     let mut all_intermediates_success = true;
 
+    // Get builders string if remote config is specified
+    let builders_str = remote_config.map(|rc| rc.to_builders_arg());
+    let builders = builders_str.as_deref();
+
     if full_rebuild {
         info!("Using full-rebuild mode (prune store paths, no cache)");
     } else {
@@ -99,9 +104,9 @@ pub async fn process_pr(
         }
 
         let result = if full_rebuild {
-            prune_and_build_attr(&worktree_path, &attr, sub_attr, system, &worktree_path).await
+            prune_and_build_attr(&worktree_path, &attr, sub_attr, system, &worktree_path, builders).await
         } else {
-            build_attr_cache_friendly(&worktree_path, &attr, sub_attr, system, &worktree_path).await
+            build_attr_cache_friendly(&worktree_path, &attr, sub_attr, system, &worktree_path, builders).await
         };
 
         if !result.success() {
@@ -133,14 +138,14 @@ pub async fn process_pr(
             // Build package
             let mut cmd = format!("nix build --print-build-logs --no-link --impure --expr '(import {} {{ system = \"{}\"; config = {{ allowUnfree = true; }}; }}).{}'", worktree_path.display(), system, attr);
 
-            let (mut c, mut l) = build_package(&worktree_path, &attr, system, false).await?;
+            let (mut c, mut l) = build_package(&worktree_path, &attr, system, false, builders).await?;
 
             info!("Package build finished. Log length: {}. Checking for cache hit...", l.len());
             let built_locally = l.contains("building '/nix/store");
             if c == Some(0) && (l.contains("copying path") || l.contains("will be fetched") || !built_locally) {
                 info!("Package was fetched from cache or already existed. Forcing rebuild to verify...");
                 cmd = format!("nix build --print-build-logs --no-link --rebuild --impure --expr '(import {} {{ system = \"{}\"; config = {{ allowUnfree = true; }}; }}).{}'", worktree_path.display(), system, attr);
-                let (c2, l2) = build_package(&worktree_path, &attr, system, true).await?;
+                let (c2, l2) = build_package(&worktree_path, &attr, system, true, builders).await?;
                 c = c2;
                 l = l2;
             }
@@ -150,13 +155,13 @@ pub async fn process_pr(
             // Cache-friendly mode: build with cache, use --rebuild if cached
             let cmd = format!("nix build --print-build-logs --no-link --impure --expr '(import {} {{ system = \"{}\"; config = {{ allowUnfree = true; }}; }}).{}' (+ --rebuild if cached)", worktree_path.display(), system, attr);
 
-            let (mut c, mut l) = build_package(&worktree_path, &attr, system, false).await?;
+            let (mut c, mut l) = build_package(&worktree_path, &attr, system, false, builders).await?;
 
             info!("Package build finished. Log length: {}. Checking for cache hit...", l.len());
             let built_locally = l.contains("building '/nix/store");
             if c == Some(0) && (l.contains("copying path") || l.contains("will be fetched") || !built_locally) {
                 info!("Package was fetched from cache or already existed. Forcing rebuild to verify...");
-                let (c2, l2) = build_package(&worktree_path, &attr, system, true).await?;
+                let (c2, l2) = build_package(&worktree_path, &attr, system, true, builders).await?;
                 // Combine logs
                 l = format!("{}\n--- Running --rebuild to verify cached package ---\n{}", l, l2);
                 c = c2;
@@ -249,7 +254,8 @@ pub async fn process_pr(
     // Post to GitHub if not dry run
     if !dry_run {
         if let Some(token_str) = token {
-            post_github_comment(pr_num, token_str, &message).await?;
+            let comment_url = post_github_comment(pr_num, token_str, &message).await?;
+            println!("\nComment posted: {}", comment_url);
         } else {
             warn!("No GitHub token provided, skipping comment post");
         }

@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command as TokioCommand;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cache::get_log_dir;
 use crate::commands::{run_command_async, run_command_tee_async};
@@ -187,257 +187,6 @@ pub async fn run_nix_eval_jobs_pkgset(
     Ok(results)
 }
 
-/// TODO this is a hack.
-/// It would be better to build this as
-/// - build the thing pulling EVERYTHING from cache
-/// - build the thing again using --check
-/// I don't think this should be an error
-/// Right now this:
-/// - deletes multiple store paths in a single nix-store call with 30s timeout
-/// - retries until success, with prompts to fix issues manually
-pub async fn delete_store_paths_batch(store_paths: &[String], pr_num: u64) -> Result<()> {
-    if store_paths.is_empty() {
-        return Ok(());
-    }
-
-    let mut paths_to_delete = store_paths.to_vec();
-    let mut timeout_secs = 30;
-
-    loop {
-        if paths_to_delete.is_empty() {
-            return Ok(());
-        }
-
-        let (success, failed_path) =
-            delete_store_paths_batch_once(&paths_to_delete, pr_num, timeout_secs).await?;
-        if success {
-            return Ok(());
-        }
-
-        error!("\n========================================");
-        error!("GC FAILED - Some paths could not be deleted.");
-        if let Some(ref p) = failed_path {
-            error!("Failed path: {}", p);
-        }
-        error!("Check the error above and fix it manually.");
-        error!("Common fixes:");
-        error!("  - Kill any running nix processes");
-        error!("  - Run: nix-collect-garbage");
-        error!("  - Check referrers: nix-store --query --referrers <path>");
-        error!("========================================");
-        error!("Press Enter to retry GC, 's' to skip failing path, 't' to add 30s to timeout, 'm' to set timeout in minutes (current: {}s), or Ctrl-C to abort...", timeout_secs);
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-
-        let trimmed = input.trim();
-        if trimmed == "s" {
-            if let Some(p) = failed_path {
-                if let Some(idx) = paths_to_delete.iter().position(|x| x == &p) {
-                    paths_to_delete.remove(idx);
-                    eprintln!("Skipping path: {}", p);
-                } else {
-                    eprintln!("Warning: Failed path '{}' not found in pending list.", p);
-                }
-            } else {
-                eprintln!("No specific failing path detected to skip.");
-            }
-        } else if trimmed == "t" {
-            timeout_secs += 30;
-            eprintln!("Timeout increased to {}s", timeout_secs);
-        } else if trimmed == "m" {
-            eprintln!("Enter timeout in minutes:");
-            let mut min_input = String::new();
-            if std::io::stdin().read_line(&mut min_input).is_ok() {
-                if let Ok(mins) = min_input.trim().parse::<u64>() {
-                    timeout_secs = mins * 60;
-                    eprintln!("Timeout set to {}s ({} minutes)", timeout_secs, mins);
-                } else {
-                    eprintln!("Invalid number");
-                }
-            }
-        }
-    }
-}
-
-/// attempt to delete store paths
-/// return true if successful
-async fn delete_store_paths_batch_once(
-    store_paths: &[String],
-    pr_num: u64,
-    timeout_secs: u64,
-) -> Result<(bool, Option<String>)> {
-    info!("Batch deleting {} store paths...", store_paths.len());
-
-    // Set up log file for GC output
-    let log_file = get_log_dir(pr_num)
-        .map(|dir| dir.join("gc.log"))
-        .ok()
-        .and_then(|p| std::fs::File::create(p).ok());
-    let log_file = Arc::new(Mutex::new(log_file));
-
-    // log the paths we're trying to delete (to file and console via tracing)
-    if let Ok(mut file_guard) = log_file.lock() {
-        if let Some(ref mut file) = *file_guard {
-            let _ = writeln!(
-                file,
-                "=== Attempting to delete {} store paths ===",
-                store_paths.len()
-            );
-            for path in store_paths {
-                let _ = writeln!(file, "  {}", path);
-            }
-            let _ = writeln!(file, "=== Starting nix-store --delete ===");
-            let _ = file.flush();
-        }
-    }
-    info!("GC: Attempting to delete {} store paths", store_paths.len());
-
-    let mut args = vec!["nix-store", "--delete", "--ignore-liveness"];
-    args.extend(store_paths.iter().map(|s| s.as_str()));
-
-    // print the moderately dangerous root command so the user knows
-    let cmd_str = format!("sudo {}", args.join(" "));
-    info!("GC: Running: {}", cmd_str);
-    if let Ok(mut file_guard) = log_file.lock() {
-        if let Some(ref mut file) = *file_guard {
-            let _ = writeln!(file, "Command: {}", cmd_str);
-            let _ = file.flush();
-        }
-    }
-
-    let mut child = TokioCommand::new("sudo")
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn sudo nix-store")?;
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    let log_file_clone = log_file.clone();
-    let stdout_task = tokio::spawn(async move {
-        if let Some(stdout) = stdout {
-            let reader = tokio::io::BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                println!("GC stdout: {}", line);
-                if let Ok(mut file_guard) = log_file_clone.lock() {
-                    if let Some(ref mut file) = *file_guard {
-                        let _ = writeln!(file, "stdout: {}", line);
-                        let _ = file.flush();
-                    }
-                }
-            }
-        }
-    });
-
-    let log_file_clone = log_file.clone();
-    let failed_path = Arc::new(Mutex::new(None));
-    let failed_path_clone = failed_path.clone();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-    let stderr_task = tokio::spawn(async move {
-        if let Some(stderr) = stderr {
-            let reader = tokio::io::BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                println!("GC stderr: {}", line);
-                if let Ok(mut file_guard) = log_file_clone.lock() {
-                    if let Some(ref mut file) = *file_guard {
-                        let _ = writeln!(file, "stderr: {}", line);
-                        let _ = file.flush();
-                    }
-                }
-                if line.contains("deleting '") {
-                    let _ = tx.try_send(());
-                }
-                if line.contains("error: cannot delete path '")
-                    || line.contains("error: Cannot delete path '")
-                {
-                    if let Some(start) = line.find("'") {
-                        if let Some(end) = line[start + 1..].find("'") {
-                            let path = line[start + 1..start + 1 + end].to_string();
-                            if let Ok(mut fp) = failed_path_clone.lock() {
-                                *fp = Some(path);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    // TODO double check that futures aren't getting dropped
-    let success = tokio::select! {
-        status_res = child.wait() => {
-            let status = status_res?;
-            let _ = Command::new("stty").arg("sane").status();
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            let msg = if status.success() {
-                format!("GC completed successfully")
-            } else {
-                format!("GC exited with {}", status)
-            };
-            println!("{}", msg);
-            if let Ok(mut file_guard) = log_file.lock() {
-                if let Some(ref mut file) = *file_guard {
-                    let _ = writeln!(file, "=== {} ===", msg);
-                }
-            }
-            if !status.success() {
-                warn!("nix-store batch delete exited with {}", status);
-            }
-            status.success()
-        }
-        _ = rx.recv() => {
-            let _ = Command::new("stty").arg("sane").status();
-            info!("Batch delete started, waiting {}s before cancelling...", timeout_secs);
-            tokio::select! {
-                status_res = child.wait() => {
-                    let status = status_res?;
-                    let _ = Command::new("stty").arg("sane").status();
-                    let _ = stdout_task.await;
-                    let _ = stderr_task.await;
-                    let msg = if status.success() {
-                        format!("GC completed successfully")
-                    } else {
-                        format!("GC exited with {}", status)
-                    };
-                    println!("{}", msg);
-                    if let Ok(mut file_guard) = log_file.lock() {
-                        if let Some(ref mut file) = *file_guard {
-                            let _ = writeln!(file, "=== {} ===", msg);
-                        }
-                    }
-                    if !status.success() {
-                        warn!("nix-store batch delete exited with {}", status);
-                    }
-                    status.success()
-                }
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(timeout_secs)) => {
-                    let _ = Command::new("stty").arg("sane").status();
-                    println!("GC: Timeout reached, killing nix-store...");
-                    if let Ok(mut file_guard) = log_file.lock() {
-                        if let Some(ref mut file) = *file_guard {
-                            let _ = writeln!(file, "=== Timeout reached, killing nix-store ===");
-                        }
-                    }
-                    info!("Timeout reached, killing nix-store...");
-                    child.kill().await?;
-                    let _ = Command::new("stty").arg("sane").status();
-                    info!("nix-store killed.");
-                    false // timeout = failure
-                }
-            }
-        }
-    };
-
-    let failed_path_val = failed_path.lock().unwrap().clone();
-    Ok((success, failed_path_val))
-}
-
 /// Check if build logs indicate non-determinism (from --check verification)
 fn is_non_deterministic_failure(logs: &str) -> bool {
     let logs_lower = logs.to_lowercase();
@@ -454,6 +203,9 @@ fn is_non_deterministic_failure(logs: &str) -> bool {
 ///
 /// Returns (attr, intermediate, success, logs, is_non_deterministic).
 /// Non-deterministic builds are treated as success but flagged.
+///
+/// The `builders` parameter, when provided, is passed to nix-build via --builders
+/// to route builds to remote machines for cross-architecture testing.
 pub async fn build_intermediate_async(
     nixpkgs_path: PathBuf,
     attr: String,
@@ -462,6 +214,7 @@ pub async fn build_intermediate_async(
     pr_num: u64,
     use_cache: bool,
     timeout_secs: u64,
+    builders: Option<&str>,
 ) -> (String, String, bool, String, bool) {
     // (attr, intermediate, success, logs, is_non_deterministic)
     let full_attr = format!("{}.{}", attr, intermediate);
@@ -493,7 +246,7 @@ pub async fn build_intermediate_async(
     let log_path = get_log_dir(pr_num)
         .map(|dir| {
             let attr_safe = attr.replace('.', "_").replace('/', "_");
-            dir.join(format!("{}.{}.log", attr_safe, intermediate))
+            dir.join(format!("{}.{}.{}.log", system, attr_safe, intermediate))
         })
         .ok();
 
@@ -503,11 +256,24 @@ pub async fn build_intermediate_async(
         .and_then(|p| std::fs::File::create(p).ok());
 
     // Build args based on mode
-    let args: Vec<&str> = if use_cache {
+    let mut args: Vec<&str> = if use_cache {
         vec!["--no-out-link", "--expr", &expr]
     } else {
         vec!["--no-out-link", "--substituters", "", "--expr", &expr]
     };
+
+    // Add --builders if specified (for remote builds)
+    if let Some(b) = builders {
+        args.push("--builders");
+        args.push(b);
+        info!("[{}] Using remote builder: {}", full_attr, b);
+    }
+
+    info!(
+        "[{}] $ nix-build {}",
+        full_attr,
+        args.join(" ")
+    );
 
     let mut child = match TokioCommand::new("nix-build")
         .args(&args)
@@ -528,14 +294,20 @@ pub async fn build_intermediate_async(
     let log_file = Arc::new(Mutex::new(log_file));
     let logs = Arc::new(Mutex::new(Vec::new()));
 
+    // Create prefix for console output: [system] [attr.intermediate]
+    let console_prefix = format!("[{}] [{}]", system, full_attr);
+
     // Spawn tasks to read stdout and stderr concurrently
     let logs_clone = logs.clone();
     let log_file_clone = log_file.clone();
+    let stdout_prefix = console_prefix.clone();
     let stdout_task = tokio::spawn(async move {
         if let Some(stdout) = stdout {
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                // Print to console with prefix
+                println!("{} {}", stdout_prefix, line);
                 // Write to log file immediately
                 if let Ok(mut file_guard) = log_file_clone.lock() {
                     if let Some(ref mut file) = *file_guard {
@@ -553,11 +325,14 @@ pub async fn build_intermediate_async(
 
     let logs_clone = logs.clone();
     let log_file_clone = log_file.clone();
+    let stderr_prefix = console_prefix.clone();
     let stderr_task = tokio::spawn(async move {
         if let Some(stderr) = stderr {
             let reader = tokio::io::BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                // Print to console with prefix
+                eprintln!("{} {}", stderr_prefix, line);
                 // Write to log file immediately
                 if let Ok(mut file_guard) = log_file_clone.lock() {
                     if let Some(ref mut file) = *file_guard {
@@ -609,11 +384,22 @@ pub async fn build_intermediate_async(
 
                 // Run --check to verify with timeout to prevent infinite hangs
                 use crate::commands::{run_nix_command_with_timeout, NixCommandResult};
+
+                // Build check args, including --builders if specified
+                let mut check_args = vec!["--no-out-link", "--check", "--expr", &expr];
+                let builders_owned: String;
+                if let Some(b) = builders {
+                    builders_owned = b.to_string();
+                    check_args.push("--builders");
+                    check_args.push(&builders_owned);
+                }
+
+                let check_prefix = format!("{} {}", system, full_attr);
                 let check_result = run_nix_command_with_timeout(
                     "nix-build",
-                    &["--no-out-link", "--check", "--expr", &expr],
+                    &check_args,
                     timeout_secs,
-                    Some(&full_attr),
+                    Some(&check_prefix),
                     log_path.as_ref().map(|p| p.as_path()),
                 )
                 .await;
@@ -663,13 +449,16 @@ pub async fn build_intermediate_async(
 }
 
 /// Build a package (final derivation) asynchronously
+///
+/// The `builders` parameter, when provided, is passed to nix build via --builders
+/// to route builds to remote machines for cross-architecture testing.
 pub async fn build_package_async(
     nixpkgs_path: PathBuf,
     attr: String,
     system: String,
     pr_num: u64,
+    builders: Option<&str>,
 ) -> (String, bool, String) {
-    // TODO as a longer term feature we should support setting the system for cross comp
     let expr = format!(
         "(import {} {{ system = \"{}\"; config = {{ allowUnfree = true; }}; }}).{}",
         nixpkgs_path.display(),
@@ -679,11 +468,18 @@ pub async fn build_package_async(
 
     info!("Building package {}", attr);
 
+    // Check if output path exists before building
+    let output_path = get_attr_path(&nixpkgs_path, &attr, "", &system).await.ok();
+    let existed_before = output_path
+        .as_ref()
+        .map(|p| std::path::Path::new(p).exists())
+        .unwrap_or(false);
+
     // Set up log file for streaming
     let log_path = get_log_dir(pr_num)
         .map(|dir| {
             let attr_safe = attr.replace('.', "_").replace('/', "_");
-            dir.join(format!("{}.package.log", attr_safe))
+            dir.join(format!("{}.{}.package.log", system, attr_safe))
         })
         .ok();
 
@@ -692,17 +488,107 @@ pub async fn build_package_async(
         .as_ref()
         .and_then(|p| std::fs::File::create(p).ok());
 
+    // Build args
+    let mut nix_args = vec![
+        "--extra-experimental-features",
+        "nix-command",
+        "build",
+        "--print-build-logs",
+        "--no-link",
+        "--impure",
+        "--expr",
+        &expr,
+    ];
+
+    // Add --builders if specified (for remote builds)
+    if let Some(b) = builders {
+        nix_args.push("--builders");
+        nix_args.push(b);
+        info!("[{}] Using remote builder: {}", attr, b);
+    }
+
+    info!(
+        "[{}] $ nix {}",
+        attr,
+        nix_args.join(" ")
+    );
+
+    // Create prefix for console output: [system] [attr]
+    let console_prefix = format!("[{}] [{}]", system, attr);
+
+    let (success, mut log_text) = run_build_with_streaming(&nix_args, log_file, Some(&console_prefix)).await;
+
+    // If build succeeded, check if we need to run --rebuild to verify
+    if success {
+        let needs_rebuild = if existed_before {
+            info!(
+                "[{}] Package already existed in store, verifying with --rebuild...",
+                attr
+            );
+            true
+        } else if let Some(ref path) = output_path {
+            let built_locally = was_built_locally(path).await.unwrap_or(false);
+            if !built_locally {
+                info!("[{}] Package was from cache, verifying with --rebuild...", attr);
+                true
+            } else {
+                info!("[{}] Package was built fresh, skipping --rebuild", attr);
+                false
+            }
+        } else {
+            false
+        };
+
+        if needs_rebuild {
+            log_text.push_str("\n--- Running --rebuild to verify package ---\n");
+
+            // Build with --rebuild
+            let mut rebuild_args = vec![
+                "--extra-experimental-features",
+                "nix-command",
+                "build",
+                "--print-build-logs",
+                "--no-link",
+                "--impure",
+                "--rebuild",
+                "--expr",
+                &expr,
+            ];
+
+            if let Some(b) = builders {
+                rebuild_args.push("--builders");
+                rebuild_args.push(b);
+            }
+
+            info!(
+                "[{}] $ nix {}",
+                attr,
+                rebuild_args.join(" ")
+            );
+
+            // Append to existing log file
+            let log_file_append = log_path
+                .as_ref()
+                .and_then(|p| std::fs::OpenOptions::new().append(true).open(p).ok());
+
+            let (rebuild_success, rebuild_logs) = run_build_with_streaming(&rebuild_args, log_file_append, Some(&console_prefix)).await;
+            log_text.push_str(&rebuild_logs);
+
+            return (attr, rebuild_success, log_text);
+        }
+    }
+
+    (attr, success, log_text)
+}
+
+/// Helper function to run a nix build command and stream output to a file and console
+async fn run_build_with_streaming(
+    nix_args: &[&str],
+    log_file: Option<std::fs::File>,
+    prefix: Option<&str>,
+) -> (bool, String) {
     let mut child = match TokioCommand::new("nix")
-        .args([
-            "--extra-experimental-features",
-            "nix-command",
-            "build",
-            "--print-build-logs",
-            "--no-link",
-            "--impure",
-            "--expr",
-            &expr,
-        ])
+        .args(nix_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -710,7 +596,7 @@ pub async fn build_package_async(
         Ok(c) => c,
         Err(e) => {
             let err_msg = format!("Failed to spawn nix build: {}", e);
-            return (attr, false, err_msg);
+            return (false, err_msg);
         }
     };
 
@@ -720,6 +606,10 @@ pub async fn build_package_async(
     let log_file = Arc::new(Mutex::new(log_file));
     let logs = Arc::new(Mutex::new(Vec::new()));
 
+    // Clone prefix for the spawned tasks
+    let stdout_prefix = prefix.map(|s| s.to_string());
+    let stderr_prefix = prefix.map(|s| s.to_string());
+
     // Spawn tasks to read stdout and stderr concurrently
     let logs_clone = logs.clone();
     let log_file_clone = log_file.clone();
@@ -728,6 +618,12 @@ pub async fn build_package_async(
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                // Print to console with prefix
+                if let Some(ref p) = stdout_prefix {
+                    println!("{} {}", p, line);
+                } else {
+                    println!("{}", line);
+                }
                 // Write to log file immediately
                 if let Ok(mut file_guard) = log_file_clone.lock() {
                     if let Some(ref mut file) = *file_guard {
@@ -750,6 +646,12 @@ pub async fn build_package_async(
             let reader = tokio::io::BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                // Print to console with prefix
+                if let Some(ref p) = stderr_prefix {
+                    eprintln!("{} {}", p, line);
+                } else {
+                    eprintln!("{}", line);
+                }
                 // Write to log file immediately
                 if let Ok(mut file_guard) = log_file_clone.lock() {
                     if let Some(ref mut file) = *file_guard {
@@ -771,7 +673,7 @@ pub async fn build_package_async(
     let success = status.map(|s| s.success()).unwrap_or(false);
     let log_text = logs.lock().map(|l| l.join("\n")).unwrap_or_default();
 
-    (attr, success, log_text)
+    (success, log_text)
 }
 
 /// Check if a package has a given sub-attribute
@@ -857,6 +759,7 @@ pub async fn build_attr(
     sub_attr: &str,
     system: &str,
     use_cache: bool,
+    builders: Option<&str>,
 ) -> Result<(Option<i32>, String)> {
     let full_attr = if sub_attr.is_empty() {
         pkg_attr.to_string()
@@ -871,17 +774,25 @@ pub async fn build_attr(
         full_attr
     );
 
+    let mut args = vec!["--no-out-link"];
+    if !use_cache {
+        args.push("--substituters");
+        args.push("");
+    }
+    if let Some(b) = builders {
+        args.push("--builders");
+        args.push(b);
+        info!("[{}] Using remote builder: {}", full_attr, b);
+    }
+    args.push("--expr");
+    args.push(&expr);
+
     if use_cache {
         info!("Building {} (cache enabled)...", full_attr);
-        run_command_tee_async("nix-build", &["--no-out-link", "--expr", &expr]).await
     } else {
         info!("Building {} with no substitutes...", full_attr);
-        run_command_tee_async(
-            "nix-build",
-            &["--no-out-link", "--substituters", "", "--expr", &expr],
-        )
-        .await
     }
+    run_command_tee_async("nix-build", &args).await
 }
 
 /// Build a package's sub-attribute with cache enabled, then run --check if needed.
@@ -898,6 +809,7 @@ pub async fn build_attr_with_check(
     pkg_attr: &str,
     sub_attr: &str,
     system: &str,
+    builders: Option<&str>,
 ) -> Result<(Option<i32>, String)> {
     let full_attr = if sub_attr.is_empty() {
         pkg_attr.to_string()
@@ -910,7 +822,7 @@ pub async fn build_attr_with_check(
     let existed_before = std::path::Path::new(&output_path).exists();
 
     // Phase 1: Build with cache enabled
-    let (code, logs) = build_attr(nixpkgs_path, pkg_attr, sub_attr, system, true).await?;
+    let (code, logs) = build_attr(nixpkgs_path, pkg_attr, sub_attr, system, true, builders).await?;
     if code != Some(0) {
         return Ok((code, logs));
     }
@@ -946,11 +858,16 @@ pub async fn build_attr_with_check(
             full_attr
         );
 
-        let (check_code, check_logs) = run_command_tee_async(
-            "nix-build",
-            &["--no-out-link", "--check", "--expr", &expr],
-        )
-        .await?;
+        // Build check args, including --builders if specified
+        let mut check_args = vec!["--no-out-link", "--check"];
+        if let Some(b) = builders {
+            check_args.push("--builders");
+            check_args.push(b);
+        }
+        check_args.push("--expr");
+        check_args.push(&expr);
+
+        let (check_code, check_logs) = run_command_tee_async("nix-build", &check_args).await?;
 
         // Combine logs from both phases
         let combined_logs = format!(
@@ -1070,6 +987,7 @@ pub async fn build_package(
     attr: &str,
     system: &str,
     rebuild: bool,
+    builders: Option<&str>,
 ) -> Result<(Option<i32>, String)> {
     let expr = format!(
         "(import {} {{ system = \"{}\"; config = {{ allowUnfree = true; }}; }}).{}",
@@ -1078,7 +996,11 @@ pub async fn build_package(
         attr
     );
 
-    info!("Building package {} with no substitutes...", attr);
+    info!("Building package {}...", attr);
+    if let Some(b) = builders {
+        info!("[{}] Using remote builder: {}", attr, b);
+    }
+
     let mut args = vec![
         "--extra-experimental-features",
         "nix-command",
@@ -1094,6 +1016,12 @@ pub async fn build_package(
         args.insert(5, "--rebuild");
     }
 
+    // Add --builders at the end if specified
+    if let Some(b) = builders {
+        args.push("--builders");
+        args.push(b);
+    }
+
     run_command_tee_async("nix", &args).await
 }
 
@@ -1105,6 +1033,7 @@ pub async fn prune_and_build_attr(
     sub_attr: &str,
     system: &str,
     nixpkgs_display: &PathBuf,
+    builders: Option<&str>,
 ) -> AttrBuildResult {
     let name = sub_attr.to_string();
     let full_attr = format!("{}.{}", pkg_attr, sub_attr);
@@ -1143,7 +1072,7 @@ pub async fn prune_and_build_attr(
         full_attr
     );
 
-    match build_attr(nixpkgs_path, pkg_attr, sub_attr, system, false).await {
+    match build_attr(nixpkgs_path, pkg_attr, sub_attr, system, false, builders).await {
         Ok((code, logs)) => AttrBuildResult {
             name,
             exists: true,
@@ -1172,6 +1101,7 @@ pub async fn build_attr_cache_friendly(
     sub_attr: &str,
     system: &str,
     nixpkgs_display: &PathBuf,
+    builders: Option<&str>,
 ) -> AttrBuildResult {
     let name = sub_attr.to_string();
     let full_attr = format!("{}.{}", pkg_attr, sub_attr);
@@ -1198,7 +1128,7 @@ pub async fn build_attr_cache_friendly(
         full_attr
     );
 
-    match build_attr_with_check(nixpkgs_path, pkg_attr, sub_attr, system).await {
+    match build_attr_with_check(nixpkgs_path, pkg_attr, sub_attr, system, builders).await {
         Ok((code, logs)) => AttrBuildResult {
             name,
             exists: true,

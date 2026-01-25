@@ -104,6 +104,29 @@ pub struct VerifyArgs {
     /// Only used with --full-eval.
     #[arg(long)]
     pub log_base_url: Option<String>,
+
+    /// Remote builder SSH target (e.g., "root@host", "user@192.168.1.1")
+    /// When specified with --remote-system, builds for that architecture will be
+    /// sent to the remote machine via Nix's --builders flag.
+    #[arg(long = "remote-builder")]
+    pub remote_builder: Option<String>,
+
+    /// Remote system architecture (e.g., "aarch64-linux")
+    /// Must be specified together with --remote-builder.
+    #[arg(long = "remote-system")]
+    pub remote_system: Option<String>,
+
+    /// Maximum parallel jobs on the remote builder (default: 4)
+    #[arg(long = "remote-build-jobs", default_value_t = 4)]
+    pub remote_build_jobs: usize,
+
+    /// Trigger GC on remote when disk exceeds threshold (e.g., "50G", "100GB")
+    #[arg(long)]
+    pub remote_gc_threshold: Option<String>,
+
+    /// Keep builds newer than N days during remote GC
+    #[arg(long)]
+    pub remote_gc_keep_days: Option<u64>,
 }
 
 #[derive(Parser, Debug)]
@@ -157,6 +180,20 @@ pub struct FixHashArgs {
     /// Operations that exceed this timeout will be cancelled and marked as failed.
     #[arg(long, default_value_t = 3600)]
     pub nix_timeout: u64,
+
+    /// Remote builder SSH target (e.g., "root@host", "user@192.168.1.1")
+    /// When specified with --remote-system, builds will be sent to the remote machine.
+    #[arg(long = "remote-builder")]
+    pub remote_builder: Option<String>,
+
+    /// Remote system architecture (e.g., "aarch64-linux")
+    /// Must be specified together with --remote-builder.
+    #[arg(long = "remote-system")]
+    pub remote_system: Option<String>,
+
+    /// Maximum parallel jobs on the remote builder (default: 4)
+    #[arg(long = "remote-build-jobs", default_value_t = 4)]
+    pub remote_build_jobs: usize,
 }
 
 #[derive(Parser, Debug)]
@@ -191,6 +228,29 @@ pub struct CheckAllArgs {
     /// Operations that exceed this timeout will be cancelled and marked as failed.
     #[arg(long, default_value_t = 3600)]
     pub nix_timeout: u64,
+
+    /// Remote builder SSH target (e.g., "root@host", "user@192.168.1.1")
+    /// When specified with --remote-system, builds for that architecture will be
+    /// sent to the remote machine via Nix's --builders flag.
+    #[arg(long = "remote-builder")]
+    pub remote_builder: Option<String>,
+
+    /// Remote system architecture (e.g., "aarch64-linux")
+    /// Must be specified together with --remote-builder.
+    #[arg(long = "remote-system")]
+    pub remote_system: Option<String>,
+
+    /// Maximum parallel jobs on the remote builder (default: 4)
+    #[arg(long = "remote-build-jobs", default_value_t = 4)]
+    pub remote_build_jobs: usize,
+
+    /// Trigger GC on remote when disk exceeds threshold (e.g., "50G", "100GB")
+    #[arg(long)]
+    pub remote_gc_threshold: Option<String>,
+
+    /// Keep builds newer than N days during remote GC
+    #[arg(long)]
+    pub remote_gc_keep_days: Option<u64>,
 }
 
 #[cfg(test)]
@@ -485,6 +545,159 @@ mod tests {
             assert!(verify_args.full_eval, "--full-eval should be true");
         } else {
             panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_remote_builder_defaults() {
+        // Remote builder should be None by default
+        let args = Args::try_parse_from(["srcbot", "verify", "--prs", "12345"]).unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert!(verify_args.remote_builder.is_none());
+            assert!(verify_args.remote_system.is_none());
+            assert_eq!(verify_args.remote_build_jobs, 4);
+            assert!(verify_args.remote_gc_threshold.is_none());
+            assert!(verify_args.remote_gc_keep_days.is_none());
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_remote_builder_basic() {
+        // Test basic remote builder specification
+        let args = Args::try_parse_from([
+            "srcbot",
+            "verify",
+            "--full-eval",
+            "--prs",
+            "12345",
+            "--remote-builder",
+            "root@150.136.78.22",
+            "--remote-system",
+            "aarch64-linux",
+        ])
+        .unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert_eq!(verify_args.remote_builder, Some("root@150.136.78.22".to_string()));
+            assert_eq!(verify_args.remote_system, Some("aarch64-linux".to_string()));
+            assert_eq!(verify_args.remote_build_jobs, 4); // default
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_remote_builder_all_options() {
+        // Test all remote builder options
+        let args = Args::try_parse_from([
+            "srcbot",
+            "verify",
+            "--full-eval",
+            "--prs",
+            "12345",
+            "--remote-builder",
+            "user@arm-server",
+            "--remote-system",
+            "aarch64-linux",
+            "--remote-build-jobs",
+            "2",
+            "--remote-gc-threshold",
+            "50G",
+            "--remote-gc-keep-days",
+            "1",
+        ])
+        .unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert_eq!(verify_args.remote_builder, Some("user@arm-server".to_string()));
+            assert_eq!(verify_args.remote_system, Some("aarch64-linux".to_string()));
+            assert_eq!(verify_args.remote_build_jobs, 2);
+            assert_eq!(verify_args.remote_gc_threshold, Some("50G".to_string()));
+            assert_eq!(verify_args.remote_gc_keep_days, Some(1));
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_check_all_remote_builder() {
+        // Test remote builder for check-all command
+        let args = Args::try_parse_from([
+            "srcbot",
+            "check-all",
+            "python3Packages",
+            "/path/to/nixpkgs",
+            "--remote-builder",
+            "root@arm-host",
+            "--remote-system",
+            "aarch64-linux",
+            "--remote-build-jobs",
+            "3",
+        ])
+        .unwrap();
+        if let Commands::CheckAll(check_args) = args.command {
+            assert_eq!(check_args.remote_builder, Some("root@arm-host".to_string()));
+            assert_eq!(check_args.remote_system, Some("aarch64-linux".to_string()));
+            assert_eq!(check_args.remote_build_jobs, 3);
+        } else {
+            panic!("Expected CheckAll command");
+        }
+    }
+
+    #[test]
+    fn test_fix_hash_defaults() {
+        // Test fix-hash command defaults
+        let args = Args::try_parse_from([
+            "srcbot",
+            "fix-hash",
+            "--nixpkgs",
+            "/path/to/nixpkgs",
+            "--attribute",
+            "hello",
+        ])
+        .unwrap();
+        if let Commands::FixHash(fix_args) = args.command {
+            assert_eq!(fix_args.intermediate, "src");
+            assert_eq!(fix_args.system, "x86_64-linux");
+            assert!(!fix_args.dont_diff);
+            assert!(!fix_args.no_pr_text);
+            assert_eq!(fix_args.nix_timeout, 3600);
+            assert!(fix_args.remote_builder.is_none());
+            assert!(fix_args.remote_system.is_none());
+            assert_eq!(fix_args.remote_build_jobs, 4);
+        } else {
+            panic!("Expected FixHash command");
+        }
+    }
+
+    #[test]
+    fn test_fix_hash_remote_builder() {
+        // Test remote builder for fix-hash command
+        let args = Args::try_parse_from([
+            "srcbot",
+            "fix-hash",
+            "--nixpkgs",
+            "/path/to/nixpkgs",
+            "--attribute",
+            "python3Packages.requests",
+            "--intermediate",
+            "src",
+            "--remote-builder",
+            "root@arm-host",
+            "--remote-system",
+            "aarch64-linux",
+            "--remote-build-jobs",
+            "2",
+        ])
+        .unwrap();
+        if let Commands::FixHash(fix_args) = args.command {
+            assert_eq!(fix_args.attribute, "python3Packages.requests");
+            assert_eq!(fix_args.intermediate, "src");
+            assert_eq!(fix_args.remote_builder, Some("root@arm-host".to_string()));
+            assert_eq!(fix_args.remote_system, Some("aarch64-linux".to_string()));
+            assert_eq!(fix_args.remote_build_jobs, 2);
+        } else {
+            panic!("Expected FixHash command");
         }
     }
 }

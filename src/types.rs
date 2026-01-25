@@ -76,6 +76,9 @@ pub struct ChangedPackage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullEvalBuildResult {
     pub attr: String,
+    /// The system/architecture this result is for (e.g., "x86_64-linux", "aarch64-linux")
+    #[serde(default)]
+    pub system: String,
     pub intermediate_results: Vec<(String, bool, String)>, // (name, success, logs)
     pub package_success: bool,
     pub package_logs: String,
@@ -97,13 +100,46 @@ pub struct ChangedPackageSer {
     pub final_drv_changed: bool,
 }
 
+/// Configuration for a remote builder
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteBuilderConfig {
+    /// SSH connection string (e.g., "root@host" or "user@192.168.1.1")
+    pub ssh_target: String,
+    /// Target system architecture (e.g., "aarch64-linux")
+    pub system: String,
+    /// Maximum parallel jobs on this builder
+    pub max_jobs: usize,
+    /// Disk usage threshold for triggering GC (e.g., "50G")
+    pub gc_threshold: Option<String>,
+    /// Keep builds newer than N days during GC
+    pub gc_keep_days: Option<u64>,
+}
+
+impl RemoteBuilderConfig {
+    /// Format as Nix --builders string
+    /// Format: ssh://user@host system ssh-key max-jobs speed-factor features
+    pub fn to_builders_arg(&self) -> String {
+        format!(
+            "ssh://{} {} - {} 1 big-parallel",
+            self.ssh_target,
+            self.system,
+            self.max_jobs
+        )
+    }
+}
+
 /// Saved state for resuming a run
+/// Note: When multi-arch support is fully implemented, this will be extended to
+/// support per-system state (systems, packages_to_build per system, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
     pub pr_num: u64,
     pub merge_base: String,
     pub pr_head_sha: String,
     pub system: String,
+    /// The CLI command that was run (for COMMAND.md and summary)
+    #[serde(default)]
+    pub cli_command: String,
     /// All packages that need to be built
     pub packages_to_build: Vec<ChangedPackageSer>,
     /// Intermediate build results per package: attr -> [(intermediate_name, success, logs)]
@@ -214,6 +250,7 @@ mod tests {
     fn test_full_eval_build_result_serialize_deserialize() {
         let result = FullEvalBuildResult {
             attr: "hello".to_string(),
+            system: "x86_64-linux".to_string(),
             intermediate_results: vec![
                 ("src".to_string(), true, "ok".to_string()),
                 ("goModules".to_string(), false, "hash mismatch".to_string()),
@@ -226,6 +263,7 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: FullEvalBuildResult = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.attr, "hello");
+        assert_eq!(deserialized.system, "x86_64-linux");
         assert_eq!(deserialized.intermediate_results.len(), 2);
         assert!(!deserialized.package_success);
         assert!(!deserialized.is_false_positive);
@@ -236,6 +274,7 @@ mod tests {
     fn test_full_eval_build_result_false_positive() {
         let result = FullEvalBuildResult {
             attr: "broken-pkg".to_string(),
+            system: "aarch64-linux".to_string(),
             intermediate_results: vec![("src".to_string(), false, "404".to_string())],
             package_success: false,
             package_logs: "".to_string(),
@@ -268,6 +307,7 @@ mod tests {
             merge_base: "abc123".to_string(),
             pr_head_sha: "def456".to_string(),
             system: "x86_64-linux".to_string(),
+            cli_command: "srcbot verify --full-eval --prs 12345".to_string(),
             packages_to_build: vec![ChangedPackageSer {
                 attr: "hello".to_string(),
                 changed_intermediates: vec!["src".to_string()],
@@ -281,7 +321,26 @@ mod tests {
         let deserialized: RunState = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.pr_num, 12345);
         assert_eq!(deserialized.system, "x86_64-linux");
+        assert_eq!(deserialized.cli_command, "srcbot verify --full-eval --prs 12345");
         assert_eq!(deserialized.packages_to_build.len(), 1);
+    }
+
+    #[test]
+    fn test_run_state_backwards_compat() {
+        // Test that old serialized data without cli_command field works
+        let json = r#"{
+            "pr_num": 12345,
+            "merge_base": "abc123",
+            "pr_head_sha": "def456",
+            "system": "x86_64-linux",
+            "packages_to_build": [],
+            "intermediate_results": {},
+            "completed_results": [],
+            "intermediates_posted": false
+        }"#;
+        let deserialized: RunState = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized.pr_num, 12345);
+        assert_eq!(deserialized.cli_command, ""); // defaults to empty
     }
 
     #[test]
@@ -321,5 +380,38 @@ mod tests {
         let deserialized: ChangedPackageSer = serde_json::from_str(json).unwrap();
         assert_eq!(deserialized.attr, "old-pkg");
         assert!(!deserialized.final_drv_changed); // defaults to false
+    }
+
+    #[test]
+    fn test_remote_builder_config_to_builders_arg() {
+        let config = RemoteBuilderConfig {
+            ssh_target: "root@150.136.78.22".to_string(),
+            system: "aarch64-linux".to_string(),
+            max_jobs: 4,
+            gc_threshold: Some("50G".to_string()),
+            gc_keep_days: Some(1),
+        };
+        let builders_arg = config.to_builders_arg();
+        assert_eq!(
+            builders_arg,
+            "ssh://root@150.136.78.22 aarch64-linux - 4 1 big-parallel"
+        );
+    }
+
+    #[test]
+    fn test_remote_builder_config_serialize_deserialize() {
+        let config = RemoteBuilderConfig {
+            ssh_target: "user@arm-server".to_string(),
+            system: "aarch64-linux".to_string(),
+            max_jobs: 2,
+            gc_threshold: None,
+            gc_keep_days: None,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: RemoteBuilderConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.ssh_target, "user@arm-server");
+        assert_eq!(deserialized.system, "aarch64-linux");
+        assert_eq!(deserialized.max_jobs, 2);
+        assert!(deserialized.gc_threshold.is_none());
     }
 }

@@ -7,6 +7,7 @@ use std::sync::{Mutex, OnceLock};
 use tracing::{info, warn};
 
 use crate::full_eval_types::EvalJobOutput;
+use crate::summary::build_summary_comment;
 use crate::types::{FullEvalBuildResult, RunState};
 
 /// Global custom save location (set once at startup)
@@ -186,27 +187,53 @@ pub fn get_log_dir(pr_num: u64) -> Result<PathBuf> {
 /// * `step` - Build step (e.g., "src", "goModules", or "package")
 /// * `logs` - Log content
 /// * `commit_suffix` - Optional commit hash suffix (e.g., "abc12345" for base builds)
+/// * `system` - Optional system architecture (e.g., "x86_64-linux", "aarch64-linux")
+///              When provided, prefixes the log filename for multi-arch support
 ///
 /// # Returns
 /// Path to the saved log file
+///
+/// # Log Naming
+/// - Without system: `attr.step.log` or `attr.step.base-{commit}.log`
+/// - With system: `system.attr.step.log` or `system.attr.step.base-{commit}.log`
 pub fn save_single_log(
     pr_num: u64,
     attr: &str,
     step: &str,
     logs: &str,
     commit_suffix: Option<&str>,
+    system: Option<&str>,
 ) -> Result<PathBuf> {
     let log_dir = get_log_dir(pr_num)?;
     let attr_safe = attr.replace('.', "_").replace('/', "_");
 
-    let log_name = match commit_suffix {
-        Some(suffix) => format!("{}.{}.base-{}.log", attr_safe, step, suffix),
-        None => format!("{}.{}.log", attr_safe, step),
+    let log_name = match (system, commit_suffix) {
+        (Some(sys), Some(suffix)) => format!("{}.{}.{}.base-{}.log", sys, attr_safe, step, suffix),
+        (Some(sys), None) => format!("{}.{}.{}.log", sys, attr_safe, step),
+        (None, Some(suffix)) => format!("{}.{}.base-{}.log", attr_safe, step, suffix),
+        (None, None) => format!("{}.{}.log", attr_safe, step),
     };
 
     let log_path = log_dir.join(&log_name);
     fs::write(&log_path, logs)?;
     Ok(log_path)
+}
+
+/// Save the CLI command to COMMAND.md in the log directory
+///
+/// # Arguments
+/// * `pr_num` - PR number for directory
+/// * `cli_command` - The CLI command that was run
+///
+/// # Returns
+/// Path to the saved COMMAND.md file
+pub fn save_command_file(pr_num: u64, cli_command: &str) -> Result<PathBuf> {
+    let log_dir = get_log_dir(pr_num)?;
+    let command_path = log_dir.join("COMMAND.md");
+    let content = format!("# Command\n\n```bash\n{}\n```\n", cli_command);
+    fs::write(&command_path, &content)?;
+    info!("Saved command to {:?}", command_path);
+    Ok(command_path)
 }
 
 /// Get the log directory for a specific attribute in fix-hash operations
@@ -223,65 +250,39 @@ pub fn get_fix_hash_attr_log_dir(attr: &str) -> Result<PathBuf> {
 pub fn save_logs_locally(pr_num: u64, results: &[FullEvalBuildResult]) -> Result<PathBuf> {
     let log_dir = get_log_dir(pr_num)?;
 
-    // Count successes and failures for summary
-    let passed: Vec<_> = results.iter().filter(|r| r.package_success).collect();
-    let failed: Vec<_> = results.iter().filter(|r| !r.package_success).collect();
-
-    // Create summary.md
-    let mut summary = format!(
-        "## srcbot: Full Evaluation Results for PR #{}\n\n**Status**: {}/{} packages passed, {} failed\n\n",
+    // Create summary.md using the same function as GitHub comments (includes multi-arch support)
+    let summary = build_summary_comment(
         pr_num,
-        passed.len(),
-        results.len(),
-        failed.len()
+        results,
+        None, // log_url_base
+        None, // base_commit
+        None, // head_commit
+        None, // base_commit_short
+        None, // cli_command
+        None, // remote_config
     );
-
-    if !failed.is_empty() {
-        summary.push_str(
-            "### Failed Packages\n\n| Package | Failed Step |\n|---------|-------------|\n",
-        );
-        for result in &failed {
-            let failed_step = result
-                .intermediate_results
-                .iter()
-                .find(|(_, success, _)| !success)
-                .map(|(name, _, _)| name.as_str())
-                .unwrap_or("package");
-            summary.push_str(&format!("| {} | {} |\n", result.attr, failed_step));
-        }
-        summary.push('\n');
-    }
-
-    if !passed.is_empty() {
-        summary.push_str(&format!("### {} Packages Passed\n\n", passed.len()));
-        for result in &passed {
-            let steps: Vec<_> = result
-                .intermediate_results
-                .iter()
-                .map(|(name, _, _)| name.as_str())
-                .chain(std::iter::once("package"))
-                .collect();
-            summary.push_str(&format!("- {} ({})\n", result.attr, steps.join(", ")));
-        }
-    }
-
     fs::write(log_dir.join("summary.md"), &summary)?;
 
-    // Write individual log files
+    // Write individual log files with system prefix for multi-arch support
     for result in results {
         let attr_safe = result.attr.replace('.', "_").replace('/', "_");
+        let system = if result.system.is_empty() {
+            "x86_64-linux"
+        } else {
+            &result.system
+        };
 
         // Intermediate logs
         for (name, _success, logs) in &result.intermediate_results {
             if !logs.trim().is_empty() {
-                let log_file = log_dir.join(format!("{}.{}.log", attr_safe, name));
+                let log_file = log_dir.join(format!("{}.{}.{}.log", system, attr_safe, name));
                 fs::write(&log_file, logs)?;
             }
         }
 
         // Package log
         if !result.package_logs.trim().is_empty() {
-            let pkg_log_file = log_dir.join(format!("{}.package.log", attr_safe));
+            let pkg_log_file = log_dir.join(format!("{}.{}.package.log", system, attr_safe));
             fs::write(&pkg_log_file, &result.package_logs)?;
         }
     }

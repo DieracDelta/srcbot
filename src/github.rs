@@ -66,7 +66,8 @@ pub async fn fetch_pr_info(pr: u64, token: Option<&str>) -> Result<PullRequest> 
 }
 
 /// Post a comment to a GitHub PR
-pub async fn post_github_comment(pr: u64, token: &str, body: &str) -> Result<()> {
+/// Returns the URL of the created comment on success
+pub async fn post_github_comment(pr: u64, token: &str, body: &str) -> Result<String> {
     let client = reqwest::Client::new();
     let url = format!(
         "https://api.github.com/repos/NixOS/nixpkgs/issues/{}/comments",
@@ -90,8 +91,16 @@ pub async fn post_github_comment(pr: u64, token: &str, body: &str) -> Result<()>
         ));
     }
 
+    // Parse response to get the comment URL
+    let response_json: serde_json::Value = response.json().await?;
+    let comment_url = response_json
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("https://github.com/NixOS/nixpkgs/pull/{}#issuecomment-unknown", pr));
+
     info!("Posted comment to PR #{}", pr);
-    Ok(())
+    Ok(comment_url)
 }
 
 /// Get GitHub token from gh CLI
@@ -261,7 +270,8 @@ pub async fn create_gist_and_comment(
         }
     }
 
-    post_github_comment(pr_num, token, &comment).await?;
+    let comment_url = post_github_comment(pr_num, token, &comment).await?;
+    println!("\nComment posted: {}", comment_url);
 
     Ok(())
 }

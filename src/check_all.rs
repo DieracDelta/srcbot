@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::cli::CheckAllArgs;
 use crate::full_eval_types::EvalJobOutput;
 use crate::nix::{build_intermediate_async, run_nix_eval_jobs_pkgset};
-use crate::types::INTERMEDIATE_ATTRS;
+use crate::types::{RemoteBuilderConfig, INTERMEDIATE_ATTRS};
 
 /// Type of failure encountered during a build
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,7 +148,10 @@ fn write_failures_file(summary: &CheckAllSummary, path: &PathBuf) -> Result<()> 
 }
 
 /// Main entry point for check-all command
-pub async fn process_check_all(args: &CheckAllArgs) -> Result<bool> {
+pub async fn process_check_all(
+    args: &CheckAllArgs,
+    remote_config: Option<&RemoteBuilderConfig>,
+) -> Result<bool> {
     info!(
         "srcbot check-all: Checking {} packages in {}",
         if args.pkgset.is_empty() {
@@ -236,6 +239,7 @@ pub async fn process_check_all(args: &CheckAllArgs) -> Result<bool> {
         let system = args.system.clone();
         let intermediate_str = intermediate.to_string();
         let timeout_secs = args.nix_timeout;
+        let builders_str = remote_config.map(|rc| rc.to_builders_arg());
 
         let mut stream = stream::iter(packages_with_intermediate.iter().map(|pkg| {
             let full_attr = if pkgset.is_empty() {
@@ -243,15 +247,24 @@ pub async fn process_check_all(args: &CheckAllArgs) -> Result<bool> {
             } else {
                 format!("{}.{}", pkgset, pkg.attr)
             };
-            build_intermediate_async(
-                nixpkgs.clone(),
-                full_attr,
-                intermediate_str.clone(),
-                system.clone(),
-                0, // No PR number for check-all
-                true,
-                timeout_secs,
-            )
+            // Clone everything needed by the async block
+            let nixpkgs_clone = nixpkgs.clone();
+            let intermediate_clone = intermediate_str.clone();
+            let system_clone = system.clone();
+            let builders_clone = builders_str.clone();
+            async move {
+                build_intermediate_async(
+                    nixpkgs_clone,
+                    full_attr,
+                    intermediate_clone,
+                    system_clone,
+                    0, // No PR number for check-all
+                    true,
+                    timeout_secs,
+                    builders_clone.as_deref(),
+                )
+                .await
+            }
         }))
         .buffer_unordered(args.build_jobs);
 

@@ -31,6 +31,45 @@ cargo run --release -- check-all python3Packages /home/jrestivo/dev/nixpkgs --li
 cargo run --release -- verify --full-eval --prs 477487 --false-positive --nixpkgs /home/jrestivo/dev/nixpkgs  --verify-full-drvs
 ```
 
+## Multi-Architecture Builds
+
+srcbot supports testing packages on multiple architectures in a single run using Nix's
+distributed build protocol. Evaluation happens locally for all architectures, while builds
+are routed to the appropriate machine.
+
+### Example: Testing x86_64 + aarch64
+
+```bash
+cargo run --release -- verify --full-eval --prs 12345 \
+  --remote-builder user@arm-server \
+  --remote-system aarch64-linux \
+  --remote-build-jobs 2 \
+  --build-jobs 1 \
+  --nixpkgs /path/to/nixpkgs
+```
+
+This will:
+1. Evaluate packages for both x86_64-linux (local) and aarch64-linux locally
+2. Build x86_64-linux packages on your local machine
+3. Build aarch64-linux packages on the remote via Nix's `--builders` flag
+4. Generate a combined summary showing results per-architecture
+
+### Remote Builder Setup
+
+Your remote machine needs:
+- SSH access (passwordless via key): `ssh user@arm-server` works without password
+- Nix installed
+- The SSH user in `trusted-users` in `/etc/nix/nix.conf`
+
+### Resource Controls
+
+- `--build-jobs N`: Limit parallel builds on local machine (default: 4)
+- `--remote-build-jobs N`: Limit parallel builds on remote (default: 4)
+- `--remote-gc-threshold 50G`: Trigger GC when remote disk exceeds threshold
+- `--remote-gc-keep-days N`: Keep builds newer than N days during GC
+
+**Note**: Resume (`--resume`) is only supported for single-system runs. Multi-arch runs start fresh.
+
 # What does this implement
 
 Define an intermediate attribute of a derivation as "source" in some sense. Where that's maybe `mydrv.src` or some vendored dependency like `cargoDeps`.

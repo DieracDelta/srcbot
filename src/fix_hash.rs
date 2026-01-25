@@ -10,6 +10,7 @@ use tempfile::TempDir;
 use crate::cache::get_fix_hash_attr_log_dir;
 use crate::commands::run_command_async;
 use crate::nix::{has_attr, was_built_locally};
+use crate::types::RemoteBuilderConfig;
 
 /// Result of parsing a hash mismatch from nix build output
 #[derive(Debug, Clone)]
@@ -120,6 +121,7 @@ async fn build_intermediate(
     system: &str,
     log_suffix: &str,
     timeout_secs: u64,
+    builders: Option<&str>,
 ) -> Result<(bool, String, Option<String>)> {
     use crate::commands::{run_nix_command_with_timeout, NixCommandResult};
     use std::io::Write;
@@ -170,16 +172,31 @@ async fn build_intermediate(
     //   - "after": cache-friendly build (can use substituters), then verify if from cache
     let is_after_build = log_suffix != "before";
     let using_cache_friendly_build = is_after_build && !store_path_exists;
-    let args: Vec<&str> = if store_path_exists {
+
+    // Build args dynamically to include --builders if specified
+    let builders_owned = builders.map(|b| b.to_string());
+    let mut args: Vec<&str> = Vec::new();
+    args.push("--no-out-link");
+
+    if store_path_exists {
         // Path exists - use --check to verify
-        vec!["--no-out-link", "--check", "--expr", &expr]
-    } else if is_after_build {
-        // "after" build: cache-friendly mode
-        vec!["--no-out-link", "--expr", &expr]
-    } else {
+        args.push("--check");
+    } else if !is_after_build {
         // "before" build: force fresh fetch to trigger hash mismatch
-        vec!["--no-out-link", "--substituters", "", "--expr", &expr]
-    };
+        args.push("--substituters");
+        args.push("");
+    }
+    // "after" build: cache-friendly mode (no extra args needed)
+
+    // Add --builders if specified
+    if let Some(ref b) = builders_owned {
+        args.push("--builders");
+        args.push(b);
+        info!("[{}] Using remote builder: {}", full_attr, b);
+    }
+
+    args.push("--expr");
+    args.push(&expr);
 
     // Print the command being run
     let cmd_str = format!("nix-build {}", args.join(" "));
@@ -288,9 +305,18 @@ async fn build_intermediate(
             if needs_check {
                 log_text.push_str("\n--- Running --check to verify FOD ---\n");
 
+                // Build check args, including --builders if specified
+                let mut check_args = vec!["--no-out-link", "--check"];
+                if let Some(ref b) = builders_owned {
+                    check_args.push("--builders");
+                    check_args.push(b);
+                }
+                check_args.push("--expr");
+                check_args.push(&expr);
+
                 let check_result = run_nix_command_with_timeout(
                     "nix-build",
-                    &["--no-out-link", "--check", "--expr", &expr],
+                    &check_args,
                     timeout_secs,
                     Some(&full_attr),
                     Some(&log_path), // Stream to log file
@@ -770,6 +796,7 @@ async fn process_fix_hash_worktree(
     log_base_url: &str,
     no_pr_text: bool,
     nix_timeout: u64,
+    builders: Option<&str>,
 ) -> Result<bool> {
     info!("==========================================");
     info!("Fix Hash Worktree: {} ({})", attribute, intermediate);
@@ -804,6 +831,7 @@ async fn process_fix_hash_worktree(
         system,
         "before",
         nix_timeout,
+        builders,
     ).await?;
 
     if success {
@@ -887,6 +915,7 @@ async fn process_fix_hash_worktree(
         system,
         "after",
         nix_timeout,
+        builders,
     ).await?;
 
     if !rebuild_success {
@@ -1050,6 +1079,7 @@ pub async fn process_fix_hash(
     log_base_url: &str,
     no_pr_text: bool,
     nix_timeout: u64,
+    remote_config: Option<&RemoteBuilderConfig>,
 ) -> Result<bool> {
     info!("==========================================");
     info!("Fix Hash: {} ({})", attribute, intermediate);
@@ -1114,6 +1144,10 @@ pub async fn process_fix_hash(
     .await
     .context("Failed to create worktree")?;
 
+    // Get builders string from remote config
+    let builders_str = remote_config.map(|rc| rc.to_builders_arg());
+    let builders = builders_str.as_deref();
+
     // Call inner function with the worktree path
     let result = process_fix_hash_worktree(
         &worktree_path,
@@ -1127,6 +1161,7 @@ pub async fn process_fix_hash(
         log_base_url,
         no_pr_text,
         nix_timeout,
+        builders,
     ).await;
 
     // Check if we should preserve the temp dir on failure

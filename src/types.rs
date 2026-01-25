@@ -82,6 +82,9 @@ pub struct FullEvalBuildResult {
     /// True if the failure also exists on the base branch (pre-existing failure)
     #[serde(default)]
     pub is_false_positive: bool,
+    /// True if any intermediate or final build was non-deterministic (hash mismatch on --check)
+    #[serde(default)]
+    pub is_non_deterministic: bool,
 }
 
 /// Serializable version of ChangedPackage for state persistence
@@ -218,6 +221,7 @@ mod tests {
             package_success: false,
             package_logs: "failed".to_string(),
             is_false_positive: false,
+            is_non_deterministic: false,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: FullEvalBuildResult = serde_json::from_str(&json).unwrap();
@@ -225,6 +229,7 @@ mod tests {
         assert_eq!(deserialized.intermediate_results.len(), 2);
         assert!(!deserialized.package_success);
         assert!(!deserialized.is_false_positive);
+        assert!(!deserialized.is_non_deterministic);
     }
 
     #[test]
@@ -235,6 +240,7 @@ mod tests {
             package_success: false,
             package_logs: "".to_string(),
             is_false_positive: true,
+            is_non_deterministic: false,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: FullEvalBuildResult = serde_json::from_str(&json).unwrap();

@@ -255,7 +255,7 @@ pub async fn process_check_all(args: &CheckAllArgs) -> Result<bool> {
         }))
         .buffer_unordered(args.build_jobs);
 
-        while let Some((attr, intermediate_name, success, logs)) = stream.next().await {
+        while let Some((attr, intermediate_name, success, logs, _is_non_det)) = stream.next().await {
             if success {
                 intermediate_summary.passed += 1;
             } else {

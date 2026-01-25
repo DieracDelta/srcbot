@@ -79,19 +79,34 @@ pub fn build_summary_comment(
         .iter()
         .filter(|r| !r.package_success && r.is_false_positive)
         .collect();
+    // Non-deterministic packages (passed but with non-deterministic output)
+    let non_deterministic_count = results.iter().filter(|r| r.is_non_deterministic).count();
 
     let total_failed = real_failed.len() + false_positives.len();
 
     let mut summary = format!(
-        "## srcbot: Full Evaluation Results for PR #{}\n\n**Status**: {}/{} packages passed, {} failed",
-        pr_num,
+        "## srcbot: Full Evaluation Results for PR #{}",
+        pr_num
+    );
+
+    // Show base commit in header if available
+    if let Some(commit) = base_commit {
+        let short = &commit[..8.min(commit.len())];
+        summary.push_str(&format!(" (vs `{}`)", short));
+    }
+
+    summary.push_str(&format!(
+        "\n\n**Status**: {}/{} packages passed, {} failed",
         passed.len(),
         results.len(),
         total_failed
-    );
+    ));
 
     if !false_positives.is_empty() {
         summary.push_str(&format!(" ({} pre-existing)", false_positives.len()));
+    }
+    if non_deterministic_count > 0 {
+        summary.push_str(&format!(", {} non-deterministic", non_deterministic_count));
     }
     summary.push_str("\n\n");
 
@@ -159,7 +174,12 @@ pub fn build_summary_comment(
                 base_commit_short,
                 false, // no before/after for passed packages
             );
-            summary.push_str(&format!("| {} | {} |\n", result.attr, steps));
+            let non_det_marker = if result.is_non_deterministic {
+                " (non-deterministic)"
+            } else {
+                ""
+            };
+            summary.push_str(&format!("| {}{} | {} |\n", result.attr, non_det_marker, steps));
         }
         summary.push_str("\n</details>\n");
     }
@@ -179,6 +199,7 @@ mod tests {
             package_success: true,
             package_logs: "".to_string(),
             is_false_positive: false,
+            is_non_deterministic: false,
         }];
         let summary = build_summary_comment(123, &results, None, None, None);
         assert!(summary.contains("1/1 packages passed"));
@@ -194,6 +215,7 @@ mod tests {
             package_success: false,
             package_logs: "".to_string(),
             is_false_positive: false,
+            is_non_deterministic: false,
         }];
         let summary = build_summary_comment(123, &results, None, None, None);
         assert!(summary.contains("0/1 packages passed"));
@@ -211,6 +233,7 @@ mod tests {
             package_success: false,
             package_logs: "".to_string(),
             is_false_positive: true,
+            is_non_deterministic: false,
         }];
         let summary = build_summary_comment(123, &results, None, Some("abc123def456"), None);
         assert!(summary.contains("0/1 packages passed"));
@@ -218,7 +241,7 @@ mod tests {
         assert!(summary.contains("1 pre-existing"));
         assert!(summary.contains("Pre-existing Failures"));
         assert!(summary.contains("prebroken"));
-        assert!(summary.contains("`abc123de`")); // Short commit in message
+        assert!(summary.contains("(vs `abc123de`)")); // Short commit in header
         // When there are only false positives, we shouldn't show the "introduced by this PR" section
         assert!(!summary.contains("introduced by this PR"));
     }
@@ -232,6 +255,7 @@ mod tests {
                 package_success: true,
                 package_logs: "".to_string(),
                 is_false_positive: false,
+                is_non_deterministic: false,
             },
             FullEvalBuildResult {
                 attr: "real-fail".to_string(),
@@ -239,6 +263,7 @@ mod tests {
                 package_success: false,
                 package_logs: "".to_string(),
                 is_false_positive: false,
+                is_non_deterministic: false,
             },
             FullEvalBuildResult {
                 attr: "false-positive".to_string(),
@@ -246,6 +271,7 @@ mod tests {
                 package_success: false,
                 package_logs: "".to_string(),
                 is_false_positive: true,
+                is_non_deterministic: false,
             },
         ];
         let summary = build_summary_comment(123, &results, None, None, None);
@@ -266,6 +292,7 @@ mod tests {
             package_success: false,
             package_logs: "".to_string(),
             is_false_positive: false,
+            is_non_deterministic: false,
         }];
         // With log_url_base and base_commit_short, we get before/after links
         let summary = build_summary_comment(
@@ -288,6 +315,7 @@ mod tests {
             package_success: true,
             package_logs: "".to_string(),
             is_false_positive: false,
+            is_non_deterministic: false,
         }];
         // Passed packages get simple step links (no before/after)
         let summary = build_summary_comment(

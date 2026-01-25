@@ -481,6 +481,7 @@ pub async fn process_pr_full_eval(
                     package_success: false,
                     package_logs: String::new(),
                     is_false_positive: false,
+                    is_non_deterministic: false,
                 },
             )
         })
@@ -537,8 +538,15 @@ pub async fn process_pr_full_eval(
         }))
         .buffer_unordered(build_jobs); // Use same parallelism as final builds
 
-        while let Some((attr, intermediate_name, success, logs)) = stream.next().await {
+        while let Some((attr, intermediate_name, success, logs, is_non_det)) = stream.next().await {
             // Log is already streamed to file by build_intermediate_async
+
+            // If non-deterministic, flag the package but treat as success
+            if is_non_det {
+                if let Some(result) = results.get_mut(&attr) {
+                    result.is_non_deterministic = true;
+                }
+            }
 
             // Check for false positive if build failed and flag is set
             let mut is_fp = false;
@@ -575,7 +583,7 @@ pub async fn process_pr_full_eval(
                         "Checking if {}.{} is a false positive (building against base)...",
                         attr, intermediate_name
                     );
-                    let (_, _, base_success, base_logs) = build_intermediate_async(
+                    let (_, _, base_success, base_logs, _) = build_intermediate_async(
                         base_path.clone(),
                         attr.clone(),
                         intermediate_name.clone(),

@@ -438,6 +438,12 @@ async fn delete_store_paths_batch_once(
     Ok((success, failed_path_val))
 }
 
+/// Check if build logs indicate non-determinism (from --check verification)
+fn is_non_deterministic_failure(logs: &str) -> bool {
+    let logs_lower = logs.to_lowercase();
+    logs_lower.contains("may not be deterministic") || logs_lower.contains("output") && logs_lower.contains("differs")
+}
+
 /// Build a single intermediate attribute (async wrapper for parallel execution)
 ///
 /// If `use_cache` is false, uses `--substituters ""` to force fresh fetch (full rebuild mode).
@@ -445,6 +451,9 @@ async fn delete_store_paths_batch_once(
 ///
 /// The `timeout_secs` parameter specifies the maximum time to wait for nix operations
 /// before killing the process to prevent infinite hangs.
+///
+/// Returns (attr, intermediate, success, logs, is_non_deterministic).
+/// Non-deterministic builds are treated as success but flagged.
 pub async fn build_intermediate_async(
     nixpkgs_path: PathBuf,
     attr: String,
@@ -453,8 +462,8 @@ pub async fn build_intermediate_async(
     pr_num: u64,
     use_cache: bool,
     timeout_secs: u64,
-) -> (String, String, bool, String) {
-    // (attr, intermediate, success, logs)
+) -> (String, String, bool, String, bool) {
+    // (attr, intermediate, success, logs, is_non_deterministic)
     let full_attr = format!("{}.{}", attr, intermediate);
     let expr = format!(
         "with import {} {{ system = \"{}\"; config = {{ allowUnfree = true; }}; }}; {}",
@@ -509,7 +518,7 @@ pub async fn build_intermediate_async(
         Ok(c) => c,
         Err(e) => {
             let err_msg = format!("Failed to spawn nix-build: {}", e);
-            return (attr, intermediate, false, err_msg);
+            return (attr, intermediate, false, err_msg, false);
         }
     };
 
@@ -617,11 +626,11 @@ pub async fn build_intermediate_async(
                             "\n--check verification timed out after {}s",
                             timeout_secs
                         ));
-                        return (attr, intermediate, false, log_text);
+                        return (attr, intermediate, false, log_text, false);
                     }
                     NixCommandResult::Failed { error } => {
                         log_text.push_str(&format!("Failed to run --check: {}", error));
-                        return (attr, intermediate, false, log_text);
+                        return (attr, intermediate, false, log_text, false);
                     }
                 };
 
@@ -636,13 +645,21 @@ pub async fn build_intermediate_async(
                 log_text.push_str(&check_logs);
 
                 if check_code != Some(0) {
-                    return (attr, intermediate, false, log_text);
+                    // Check if this is non-determinism (treat as success with warning)
+                    if is_non_deterministic_failure(&check_logs) {
+                        warn!(
+                            "Non-deterministic output detected for {}, but treating as success",
+                            full_attr
+                        );
+                        return (attr, intermediate, true, log_text, true);
+                    }
+                    return (attr, intermediate, false, log_text, false);
                 }
             }
         }
     }
 
-    (attr, intermediate, success, log_text)
+    (attr, intermediate, success, log_text, false)
 }
 
 /// Build a package (final derivation) asynchronously
@@ -1461,5 +1478,30 @@ mod tests {
         assert!(!(false || !true), "case 2: didn't exist, built fresh -> no check");
         assert!(true || !false, "case 3: existed, from cache -> check");
         assert!(true || !true, "case 4: existed, built locally -> check");
+    }
+
+    #[test]
+    fn test_is_non_deterministic_failure_detects_nix_error() {
+        // Real error message from nix --check
+        let error = "error: derivation '/nix/store/r20lrv5zxg0nb13aalrcb528a3r8c6l8-ente-auth-4.4.12.drv' may not be deterministic: output '/nix/store/v9y845m9p154pbaq4rvnj08bnzz48br1-ente-auth-4.4.12' differs";
+        assert!(is_non_deterministic_failure(error));
+    }
+
+    #[test]
+    fn test_is_non_deterministic_failure_case_insensitive() {
+        let error = "MAY NOT BE DETERMINISTIC: output differs";
+        assert!(is_non_deterministic_failure(error));
+    }
+
+    #[test]
+    fn test_is_non_deterministic_failure_false_for_other_errors() {
+        let error = "error: hash mismatch in fixed-output derivation";
+        assert!(!is_non_deterministic_failure(error));
+
+        let error2 = "error: builder failed with exit code 1";
+        assert!(!is_non_deterministic_failure(error2));
+
+        let error3 = "404 not found";
+        assert!(!is_non_deterministic_failure(error3));
     }
 }

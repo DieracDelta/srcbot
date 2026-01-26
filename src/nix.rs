@@ -263,9 +263,12 @@ pub async fn build_intermediate_async(
     };
 
     // Add --builders if specified (for remote builds)
+    // Also add --max-jobs 0 to disable local building and force remote
     if let Some(b) = builders {
         args.push("--builders");
         args.push(b);
+        args.push("--max-jobs");
+        args.push("0");
         info!("[{}] Using remote builder: {}", full_attr, b);
     }
 
@@ -392,6 +395,8 @@ pub async fn build_intermediate_async(
                     builders_owned = b.to_string();
                     check_args.push("--builders");
                     check_args.push(&builders_owned);
+                    check_args.push("--max-jobs");
+                    check_args.push("0");
                 }
 
                 let check_prefix = format!("{} {}", system, full_attr);
@@ -501,9 +506,12 @@ pub async fn build_package_async(
     ];
 
     // Add --builders if specified (for remote builds)
+    // Also add --max-jobs 0 to disable local building and force remote
     if let Some(b) = builders {
         nix_args.push("--builders");
         nix_args.push(b);
+        nix_args.push("--max-jobs");
+        nix_args.push("0");
         info!("[{}] Using remote builder: {}", attr, b);
     }
 
@@ -558,6 +566,8 @@ pub async fn build_package_async(
             if let Some(b) = builders {
                 rebuild_args.push("--builders");
                 rebuild_args.push(b);
+                rebuild_args.push("--max-jobs");
+                rebuild_args.push("0");
             }
 
             info!(
@@ -799,6 +809,8 @@ pub async fn build_attr(
     if let Some(b) = builders {
         args.push("--builders");
         args.push(b);
+        args.push("--max-jobs");
+        args.push("0");
         info!("[{}] Using remote builder: {}", full_attr, b);
     }
     args.push("--expr");
@@ -880,6 +892,8 @@ pub async fn build_attr_with_check(
         if let Some(b) = builders {
             check_args.push("--builders");
             check_args.push(b);
+            check_args.push("--max-jobs");
+            check_args.push("0");
         }
         check_args.push("--expr");
         check_args.push(&expr);
@@ -1034,9 +1048,12 @@ pub async fn build_package(
     }
 
     // Add --builders at the end if specified
+    // Also add --max-jobs 0 to disable local building and force remote
     if let Some(b) = builders {
         args.push("--builders");
         args.push(b);
+        args.push("--max-jobs");
+        args.push("0");
     }
 
     run_command_tee_async("nix", &args).await

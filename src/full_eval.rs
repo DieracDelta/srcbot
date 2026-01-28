@@ -22,10 +22,14 @@ use crate::types::{
 
 /// Find packages whose intermediate drvPaths changed between base and PR.
 /// If `verify_full_drvs` is true, also include packages where only the final drvPath changed.
+/// If `aggressively_check_fods` is true, include ALL available intermediates for changed packages,
+/// not just the ones that changed. This ensures upstream sources are verified even when only
+/// build machinery changed.
 pub fn find_changed_packages(
     base: &[EvalJobOutput],
     pr: &[EvalJobOutput],
     verify_full_drvs: bool,
+    aggressively_check_fods: bool,
 ) -> Vec<ChangedPackage> {
     // Build lookup map for base packages
     let base_map: HashMap<&str, &EvalJobOutput> =
@@ -74,6 +78,20 @@ pub fn find_changed_packages(
         }
 
         if !changed_intermediates.is_empty() {
+            // If aggressively_check_fods is enabled, include ALL available intermediates
+            if aggressively_check_fods {
+                if let Some(pr_ints) = pr_intermediates {
+                    for (name, pr_drv) in pr_ints {
+                        if let Some(drv) = pr_drv {
+                            if !changed_intermediates.contains(name) {
+                                changed_intermediates.push(name.clone());
+                                intermediate_drv_paths.insert(name.clone(), drv.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
             // Sort intermediates by the order in INTERMEDIATE_ATTRS
             changed_intermediates.sort_by_key(|name| {
                 INTERMEDIATE_ATTRS
@@ -100,10 +118,34 @@ pub fn find_changed_packages(
                 };
 
                 if final_changed {
+                    // If aggressively_check_fods is enabled, include ALL available intermediates
+                    let (intermediates, drv_paths) = if aggressively_check_fods {
+                        let mut intermediates = Vec::new();
+                        let mut drv_paths = HashMap::new();
+                        if let Some(pr_ints) = pr_intermediates {
+                            for (name, pr_drv) in pr_ints {
+                                if let Some(drv) = pr_drv {
+                                    intermediates.push(name.clone());
+                                    drv_paths.insert(name.clone(), drv.clone());
+                                }
+                            }
+                        }
+                        // Sort by INTERMEDIATE_ATTRS order
+                        intermediates.sort_by_key(|name| {
+                            INTERMEDIATE_ATTRS
+                                .iter()
+                                .position(|&a| a == name)
+                                .unwrap_or(usize::MAX)
+                        });
+                        (intermediates, drv_paths)
+                    } else {
+                        (vec![], HashMap::new())
+                    };
+
                     changed.push(ChangedPackage {
                         attr: pr_pkg.attr.clone(),
-                        changed_intermediates: vec![],
-                        intermediate_drv_paths: HashMap::new(),
+                        changed_intermediates: intermediates,
+                        intermediate_drv_paths: drv_paths,
                         final_drv_changed: true,
                     });
                 }
@@ -600,6 +642,7 @@ async fn build_packages_for_system(
 /// If `full_rebuild` is false (default), uses cache-friendly mode (allow cache, verify with --check).
 /// If `false_positive` is true, when a build fails, check if it also fails on the base branch.
 /// If `verify_full_drvs` is true, also detect packages where the final drvPath changed (not just intermediates).
+/// If `aggressively_check_fods` is true, rebuild ALL intermediates for changed packages, not just changed ones.
 /// If `log_base_url` is provided, log URLs will be included in the summary.
 /// If `remote_config` is provided, builds for that system are routed to the remote builder.
 /// `cli_command` is the command that was run, for inclusion in the summary.
@@ -617,6 +660,7 @@ pub async fn process_pr_full_eval(
     false_positive: bool,
     base_commit_override: Option<&str>,
     verify_full_drvs: bool,
+    aggressively_check_fods: bool,
     nix_timeout: u64,
     log_base_url: Option<&str>,
     remote_config: Option<&RemoteBuilderConfig>,
@@ -824,7 +868,7 @@ pub async fn process_pr_full_eval(
             };
 
             // Find changed packages for this system
-            let changed = find_changed_packages(&base_packages, &pr_packages, verify_full_drvs);
+            let changed = find_changed_packages(&base_packages, &pr_packages, verify_full_drvs, aggressively_check_fods);
             info!("Found {} changed packages for {}", changed.len(), sys);
             all_changed.insert(sys.clone(), changed);
         }

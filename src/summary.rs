@@ -148,7 +148,7 @@ pub fn build_summary_comment(
     head_commit: Option<&str>,
     base_commit_short: Option<&str>,
     cli_command: Option<&str>,
-    remote_config: Option<&RemoteBuilderConfig>,
+    _remote_config: Option<&RemoteBuilderConfig>,
 ) -> String {
     // Group results by system
     let mut results_by_system: HashMap<String, Vec<&FullEvalBuildResult>> = HashMap::new();
@@ -188,27 +188,28 @@ pub fn build_summary_comment(
         .count();
     let total_non_deterministic: usize = results.iter().filter(|r| r.is_non_deterministic).count();
 
-    let mut summary = format!("## srcbot: Full Evaluation Results for PR #{}", pr_num);
+    let mut summary = format!("## srcbot: Full Evaluation Results for PR #{}\n", pr_num);
 
-    // Show base and head commits in header if available
+    // Show base and head commits on a separate line if available
     match (base_commit, head_commit) {
         (Some(base), Some(head)) => {
             let base_short = &base[..8.min(base.len())];
             let head_short = &head[..8.min(head.len())];
-            summary.push_str(&format!(" (base: `{}`, head: `{}`)", base_short, head_short));
+            summary.push_str(&format!(
+                "\ncompared base commit `{}` against head of PR commit `{}`\n",
+                base_short, head_short
+            ));
         }
         (Some(base), None) => {
             let base_short = &base[..8.min(base.len())];
-            summary.push_str(&format!(" (base: `{}`)", base_short));
+            summary.push_str(&format!("\nbase commit: `{}`\n", base_short));
         }
         (None, Some(head)) => {
             let head_short = &head[..8.min(head.len())];
-            summary.push_str(&format!(" (head: `{}`)", head_short));
+            summary.push_str(&format!("\nhead of PR commit: `{}`\n", head_short));
         }
         (None, None) => {}
     }
-
-    summary.push('\n');
 
     // Add CLI command in collapsible section if provided
     if let Some(cmd) = cli_command {
@@ -247,12 +248,7 @@ pub fn build_summary_comment(
 
         // Add system header for multi-arch
         if is_multi_arch {
-            let system_suffix = if remote_config.map(|rc| &rc.system) == Some(system) {
-                format!(" (remote: {})", remote_config.unwrap().ssh_target)
-            } else {
-                " (local)".to_string()
-            };
-            summary.push_str(&format!("### {}{}\n\n", system, system_suffix));
+            summary.push_str(&format!("### {}\n\n", system));
         }
 
         let mut passed: Vec<_> = system_results
@@ -414,7 +410,7 @@ mod tests {
         assert!(summary.contains("1 pre-existing"));
         assert!(summary.contains("Pre-existing Failures"));
         assert!(summary.contains("prebroken"));
-        assert!(summary.contains("(base: `abc123de`)")); // Short commit in header
+        assert!(summary.contains("base commit: `abc123de`")); // Short commit on separate line
         // When there are only false positives, we shouldn't show the "introduced by this PR" section
         assert!(!summary.contains("introduced by this PR"));
     }
@@ -579,8 +575,8 @@ mod tests {
         ];
         let summary = build_summary_comment(123, &results, None, None, None, None, None, Some(&remote_config));
         // Should have system headers
-        assert!(summary.contains("### x86_64-linux (local)"));
-        assert!(summary.contains("### aarch64-linux (remote: user@arm-server)"));
+        assert!(summary.contains("### x86_64-linux"));
+        assert!(summary.contains("### aarch64-linux"));
         // Should mention multiple architectures
         assert!(summary.contains("across 2 architectures"));
     }

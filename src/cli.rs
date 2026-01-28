@@ -94,6 +94,13 @@ pub struct VerifyArgs {
     #[arg(long, default_value_t = false)]
     pub verify_full_drvs: bool,
 
+    /// When any derivation changes, also rebuild all intermediate attributes (src, goModules, etc.)
+    /// even if those specific intermediates didn't change. This verifies upstream sources are still
+    /// fetchable and match expected hashes. Enabled by default.
+    /// Only used with --full-eval.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub aggressively_check_fods: bool,
+
     /// Timeout in seconds for nix operations (builds, evals, etc.).
     /// Operations that exceed this timeout will be cancelled and marked as failed.
     #[arg(long, default_value_t = 3600)]
@@ -543,6 +550,42 @@ mod tests {
             assert!(verify_args.verify_full_drvs, "--verify-full-drvs should be true");
             assert!(verify_args.false_positive, "--false-positive should be true");
             assert!(verify_args.full_eval, "--full-eval should be true");
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_aggressively_check_fods_default_true() {
+        // Default should be true (enabled by default)
+        let args = Args::try_parse_from(["srcbot", "verify", "--prs", "12345"]).unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert!(
+                verify_args.aggressively_check_fods,
+                "--aggressively-check-fods should default to true"
+            );
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_aggressively_check_fods_can_be_disabled() {
+        // Should be false when explicitly set to false
+        let args = Args::try_parse_from([
+            "srcbot",
+            "verify",
+            "--full-eval",
+            "--aggressively-check-fods=false",
+            "--prs",
+            "12345",
+        ])
+        .unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert!(
+                !verify_args.aggressively_check_fods,
+                "--aggressively-check-fods=false should disable it"
+            );
         } else {
             panic!("Expected Verify command");
         }

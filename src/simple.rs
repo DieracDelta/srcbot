@@ -7,8 +7,8 @@ use crate::commands::run_command_async;
 use crate::git::fetch_pr_ref;
 use crate::github::{fetch_pr_info, post_github_comment};
 use crate::nix::{
-    build_attr_cache_friendly, build_package, delete_store_path, get_attr_path,
-    prune_and_build_attr,
+    build_attr_cache_friendly, build_package, build_test_async, delete_store_path,
+    discover_tests, get_attr_path, prune_and_build_attr,
 };
 use crate::types::{AttrBuildResult, RemoteBuilderConfig, INTERMEDIATE_ATTRS};
 
@@ -173,6 +173,27 @@ pub async fn process_pr(
         (None, String::new(), false, String::new())
     };
 
+    // Build tests if package succeeded
+    let mut test_results: Vec<(String, bool, String)> = Vec::new();
+    if pkg_code == Some(0) {
+        let tests = discover_tests(&worktree_path, &attr, system).await;
+        if !tests.is_empty() {
+            info!("Building {} test(s) for {}...", tests.len(), attr);
+            for test_name in tests {
+                let (_, name, success, logs) = build_test_async(
+                    worktree_path.clone(),
+                    attr.clone(),
+                    test_name,
+                    system.to_string(),
+                    pr_num,
+                    builders,
+                )
+                .await;
+                test_results.push((name, success, logs));
+            }
+        }
+    }
+
     // Clean up worktree
     let _ = run_command_async(
         "git",
@@ -212,7 +233,8 @@ pub async fn process_pr(
 
     // Construct Message
     let pkg_success = pkg_code == Some(0);
-    let overall_status = if all_intermediates_success && (!pkg_attempted || pkg_success) {
+    let tests_success = test_results.iter().all(|(_, success, _)| *success);
+    let overall_status = if all_intermediates_success && (!pkg_attempted || pkg_success) && tests_success {
         "Source verification passed"
     } else {
         "Source verification FAILED"
@@ -241,15 +263,35 @@ pub async fn process_pr(
     // Package Build Section
     if pkg_attempted {
         message.push_str(&format!("### Step {}: Build Package\n\n", step_num));
+        step_num += 1;
         message.push_str(&format!("- **Command**: `{}`\n", pkg_cmd));
         message.push_str(&format!("- **Status**: {}\n", format_status(pkg_code)));
         message.push_str(&format_log(&pkg_logs, "Package Build"));
+        message.push_str("\n\n");
     } else if let Some(failed) = failed_intermediate {
         message.push_str(&format!("### Step {}: Build Package\n\n", step_num));
-        message.push_str(&format!("_Skipped because {} build failed._", failed.name));
+        step_num += 1;
+        message.push_str(&format!("_Skipped because {} build failed._\n\n", failed.name));
     }
 
-    let exit_success = all_intermediates_success && (!pkg_attempted || pkg_success);
+    // Test Results Section
+    if !test_results.is_empty() {
+        message.push_str(&format!("### Step {}: Build Tests\n\n", step_num));
+        let tests_passed = test_results.iter().filter(|(_, s, _)| *s).count();
+        let tests_failed = test_results.len() - tests_passed;
+        message.push_str(&format!(
+            "- **Results**: {} passed, {} failed\n\n",
+            tests_passed, tests_failed
+        ));
+        for (test_name, success, logs) in &test_results {
+            let status = if *success { "✅" } else { "❌" };
+            message.push_str(&format!("#### {}.tests.{} {}\n\n", attr, test_name, status));
+            message.push_str(&format_log(logs, &format!("{} Test", test_name)));
+            message.push_str("\n\n");
+        }
+    }
+
+    let exit_success = all_intermediates_success && (!pkg_attempted || pkg_success) && tests_success;
 
     // Post to GitHub if not dry run
     if !dry_run {

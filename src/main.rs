@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
                         verify_args.base_commit.as_deref(),
                         verify_args.verify_full_drvs,
                         verify_args.aggressively_check_fods,
+                        verify_args.skip_tests,
                         verify_args.nix_timeout,
                         verify_args.log_base_url.as_deref(),
                         remote_config.as_ref(),

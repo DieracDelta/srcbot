@@ -188,6 +188,19 @@ pub fn build_summary_comment(
         .count();
     let total_non_deterministic: usize = results.iter().filter(|r| r.is_non_deterministic).count();
 
+    // Calculate test totals
+    let total_tests_passed: usize = results
+        .iter()
+        .flat_map(|r| &r.test_results)
+        .filter(|(_, success, _)| *success)
+        .count();
+    let total_tests_failed: usize = results
+        .iter()
+        .flat_map(|r| &r.test_results)
+        .filter(|(_, success, _)| !*success)
+        .count();
+    let total_tests: usize = total_tests_passed + total_tests_failed;
+
     let mut summary = format!("## srcbot: Full Evaluation Results for PR #{}\n", pr_num);
 
     // Show base and head commits on a separate line if available
@@ -237,7 +250,20 @@ pub fn build_summary_comment(
     if is_multi_arch {
         summary.push_str(&format!(" across {} architectures", systems.len()));
     }
-    summary.push_str("\n\n");
+    summary.push_str("\n");
+
+    // Add test summary if any tests were run
+    if total_tests > 0 {
+        summary.push_str(&format!(
+            "**Tests**: {}/{} passed",
+            total_tests_passed, total_tests
+        ));
+        if total_tests_failed > 0 {
+            summary.push_str(&format!(", {} failed", total_tests_failed));
+        }
+        summary.push_str("\n");
+    }
+    summary.push('\n');
 
     // Generate output per system
     for system in &systems {
@@ -322,10 +348,64 @@ pub fn build_summary_comment(
             summary.push_str("\n</details>\n\n");
         }
 
+        // Show test failures (packages that built successfully but have failing tests)
+        let mut test_failures: Vec<_> = system_results
+            .iter()
+            .filter(|r| r.package_success && r.test_results.iter().any(|(_, s, _)| !*s))
+            .collect();
+        test_failures.sort_by(|a, b| a.attr.cmp(&b.attr));
+
+        if !test_failures.is_empty() {
+            summary.push_str("<details open>\n<summary>");
+            summary.push_str(&format!(
+                "Test Failures - {} packages with failing tests</summary>\n\n",
+                test_failures.len()
+            ));
+
+            summary.push_str("| Package | Failed Tests |\n|---------|-------------|\n");
+
+            for result in &test_failures {
+                let failed_tests: Vec<_> = result
+                    .test_results
+                    .iter()
+                    .filter(|(_, s, _)| !*s)
+                    .map(|(name, _, _)| name.as_str())
+                    .collect();
+                summary.push_str(&format!(
+                    "| {} | {} |\n",
+                    result.attr,
+                    failed_tests.join(", ")
+                ));
+            }
+            summary.push_str("\n</details>\n\n");
+        }
+
         if !passed.is_empty() {
+            // Count passed packages with all tests passing vs with no tests
+            let passed_with_tests: Vec<_> = passed
+                .iter()
+                .filter(|r| !r.test_results.is_empty() && r.test_results.iter().all(|(_, s, _)| *s))
+                .collect();
+            let passed_no_tests: Vec<_> = passed
+                .iter()
+                .filter(|r| r.test_results.is_empty())
+                .collect();
+
+            let summary_text = if passed_with_tests.is_empty() {
+                format!("{} packages passed", passed.len())
+            } else if passed_no_tests.is_empty() {
+                format!("{} packages passed (all with tests)", passed.len())
+            } else {
+                format!(
+                    "{} packages passed ({} with tests)",
+                    passed.len(),
+                    passed_with_tests.len()
+                )
+            };
+
             summary.push_str("<details>\n<summary>");
-            summary.push_str(&format!("{} packages passed</summary>\n\n", passed.len()));
-            summary.push_str("| Package | Steps Built |\n|---------|-------------|\n");
+            summary.push_str(&format!("{}</summary>\n\n", summary_text));
+            summary.push_str("| Package | Steps Built | Tests |\n|---------|-------------|-------|\n");
             for result in &passed {
                 let steps = build_steps_with_links(
                     result,
@@ -338,9 +418,25 @@ pub fn build_summary_comment(
                 } else {
                     ""
                 };
+                // Format test results
+                let tests_str = if result.test_results.is_empty() {
+                    "-".to_string()
+                } else {
+                    let passed_tests: Vec<_> = result
+                        .test_results
+                        .iter()
+                        .filter(|(_, s, _)| *s)
+                        .map(|(n, _, _)| n.as_str())
+                        .collect();
+                    if passed_tests.is_empty() {
+                        "-".to_string()
+                    } else {
+                        format!("✅ {}", passed_tests.join(", "))
+                    }
+                };
                 summary.push_str(&format!(
-                    "| {}{} | {} |\n",
-                    result.attr, non_det_marker, steps
+                    "| {}{} | {} | {} |\n",
+                    result.attr, non_det_marker, steps, tests_str
                 ));
             }
             summary.push_str("\n</details>\n\n");
@@ -362,6 +458,7 @@ mod tests {
             intermediate_results: vec![("src".to_string(), true, "ok".to_string())],
             package_success: true,
             package_logs: "".to_string(),
+            test_results: vec![],
             is_false_positive: false,
             is_non_deterministic: false,
             exists_on_base: true,
@@ -380,6 +477,7 @@ mod tests {
             intermediate_results: vec![("src".to_string(), false, "error".to_string())],
             package_success: false,
             package_logs: "".to_string(),
+            test_results: vec![],
             is_false_positive: false,
             is_non_deterministic: false,
             exists_on_base: true,
@@ -400,6 +498,7 @@ mod tests {
             intermediate_results: vec![("src".to_string(), false, "error".to_string())],
             package_success: false,
             package_logs: "".to_string(),
+            test_results: vec![],
             is_false_positive: true,
             is_non_deterministic: false,
             exists_on_base: true,
@@ -424,6 +523,7 @@ mod tests {
                 intermediate_results: vec![("src".to_string(), true, "ok".to_string())],
                 package_success: true,
                 package_logs: "".to_string(),
+                test_results: vec![],
                 is_false_positive: false,
                 is_non_deterministic: false,
                 exists_on_base: true,
@@ -434,6 +534,7 @@ mod tests {
                 intermediate_results: vec![("src".to_string(), false, "error".to_string())],
                 package_success: false,
                 package_logs: "".to_string(),
+                test_results: vec![],
                 is_false_positive: false,
                 is_non_deterministic: false,
                 exists_on_base: true,
@@ -444,6 +545,7 @@ mod tests {
                 intermediate_results: vec![("src".to_string(), false, "error".to_string())],
                 package_success: false,
                 package_logs: "".to_string(),
+                test_results: vec![],
                 is_false_positive: true,
                 is_non_deterministic: false,
                 exists_on_base: true,
@@ -467,6 +569,7 @@ mod tests {
             intermediate_results: vec![("src".to_string(), false, "error".to_string())],
             package_success: false,
             package_logs: "".to_string(),
+            test_results: vec![],
             is_false_positive: false,
             is_non_deterministic: false,
             exists_on_base: true,
@@ -495,6 +598,7 @@ mod tests {
             intermediate_results: vec![("src".to_string(), true, "ok".to_string())],
             package_success: true,
             package_logs: "".to_string(),
+            test_results: vec![],
             is_false_positive: false,
             is_non_deterministic: false,
             exists_on_base: true,
@@ -522,6 +626,7 @@ mod tests {
             intermediate_results: vec![("src".to_string(), true, "ok".to_string())],
             package_success: true,
             package_logs: "".to_string(),
+            test_results: vec![],
             is_false_positive: false,
             is_non_deterministic: false,
             exists_on_base: true,
@@ -558,6 +663,7 @@ mod tests {
                 intermediate_results: vec![("src".to_string(), true, "ok".to_string())],
                 package_success: true,
                 package_logs: "".to_string(),
+                test_results: vec![],
                 is_false_positive: false,
                 is_non_deterministic: false,
                 exists_on_base: true,
@@ -568,6 +674,7 @@ mod tests {
                 intermediate_results: vec![("src".to_string(), true, "ok".to_string())],
                 package_success: true,
                 package_logs: "".to_string(),
+                test_results: vec![],
                 is_false_positive: false,
                 is_non_deterministic: false,
                 exists_on_base: true,

@@ -11,7 +11,7 @@ pub struct EvalJobOutput {
     pub drv_path: Option<String>,
     /// Error message if evaluation failed
     pub error: Option<String>,
-    /// Extra value from --apply containing intermediate drvPaths
+    /// Extra value from --apply containing intermediate drvPaths (src, goModules, etc.)
     #[serde(default)]
     pub extra_value: Option<HashMap<String, Option<String>>>,
 }

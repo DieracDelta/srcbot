@@ -12,7 +12,7 @@ use crate::commands::{run_command_async, run_command_tee_async};
 use crate::full_eval_types::EvalJobOutput;
 use crate::types::{AttrBuildResult, INTERMEDIATE_ATTRS};
 
-/// Generate the Nix --apply expression to extract intermediate drvPaths
+/// Generate the Nix --apply expression to extract intermediate and test drvPaths
 pub fn get_apply_expr() -> String {
     let attrs_list = INTERMEDIATE_ATTRS
         .iter()
@@ -23,6 +23,8 @@ pub fn get_apply_expr() -> String {
     format!(
         r#"drv: let
   intermediateAttrNames = [ {} ];
+
+  # Helper to safely get drvPath from an attribute
   tryGetDrvPath = name:
     let
       result = builtins.tryEval (
@@ -34,8 +36,8 @@ pub fn get_apply_expr() -> String {
       );
     in
     if result.success then result.value else null;
-in
-builtins.listToAttrs (
+
+in builtins.listToAttrs (
   builtins.filter (x: x.value != null) (
     map (name: {{ inherit name; value = tryGetDrvPath name; }}) intermediateAttrNames
   )
@@ -589,6 +591,140 @@ pub async fn build_package_async(
     }
 
     (attr, success, log_text)
+}
+
+/// Build a single test from passthru.tests asynchronously
+///
+/// Returns (pkg_attr, test_name, success, logs)
+pub async fn build_test_async(
+    nixpkgs_path: PathBuf,
+    pkg_attr: String,
+    test_name: String,
+    system: String,
+    pr_num: u64,
+    builders: Option<&str>,
+) -> (String, String, bool, String) {
+    // Build expression like: pkgs.hello.passthru.tests.unit or pkgs.hello.tests.unit
+    let expr = format!(
+        r#"let
+  pkgs = import {} {{ system = "{}"; config = {{ allowUnfree = true; }}; }};
+  pkg = pkgs.{};
+  testsAttr = pkg.passthru.tests or pkg.tests or {{}};
+in testsAttr.{}"#,
+        nixpkgs_path.display(),
+        system,
+        pkg_attr,
+        test_name
+    );
+
+    let full_test_attr = format!("{}.tests.{}", pkg_attr, test_name);
+    info!("Building test {}", full_test_attr);
+
+    // Build the test
+    let attr_safe = pkg_attr.replace(['.', '/'], "_");
+    let log_dir = crate::cache::get_log_dir(pr_num).ok();
+    let log_filename = format!("{}.{}.test.{}.log", system, attr_safe, test_name);
+    let log_path = log_dir.map(|d| d.join(&log_filename));
+
+    // Create/truncate log file
+    if let Some(ref path) = log_path {
+        if let Err(e) = std::fs::write(path, "") {
+            warn!("Failed to create log file {}: {}", path.display(), e);
+        }
+    }
+
+    let mut nix_args: Vec<&str> = vec!["build", "--no-link", "--print-build-logs"];
+
+    // Add builders arg if provided
+    let builders_owned: String;
+    if let Some(b) = builders {
+        nix_args.push("--builders");
+        builders_owned = b.to_string();
+        nix_args.push(&builders_owned);
+        nix_args.push("--max-jobs");
+        nix_args.push("0");
+    }
+
+    nix_args.push("--impure");
+    nix_args.push("--expr");
+    nix_args.push(&expr);
+
+    let console_prefix = format!("[{}.{}]", pkg_attr, test_name);
+    info!(
+        "[{}.{}] $ nix {}",
+        pkg_attr,
+        test_name,
+        nix_args.join(" ")
+    );
+
+    let log_file = log_path.as_ref().and_then(|p| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()
+    });
+
+    let (success, log_text) = run_build_with_streaming(&nix_args, log_file, Some(&console_prefix)).await;
+
+    (pkg_attr, test_name, success, log_text)
+}
+
+/// Discover test names for a package by evaluating passthru.tests or .tests
+///
+/// Returns a vector of test names (e.g., ["unit", "integration"])
+pub async fn discover_tests(
+    nixpkgs_path: &std::path::Path,
+    attr: &str,
+    system: &str,
+) -> Vec<String> {
+    // Use nix eval to get the test attribute names
+    let expr = format!(
+        r#"let
+  pkgs = import {} {{ system = "{}"; config = {{ allowUnfree = true; }}; }};
+  pkg = pkgs.{};
+  testsAttr = pkg.passthru.tests or pkg.tests or {{}};
+  # Filter to only derivations (some tests might be functions)
+  testNames = builtins.filter (name:
+    let val = testsAttr.${{name}}; in
+    builtins.isAttrs val && val ? drvPath
+  ) (builtins.attrNames testsAttr);
+in testNames"#,
+        nixpkgs_path.display(),
+        system,
+        attr
+    );
+
+    let output = match TokioCommand::new("nix")
+        .args(["eval", "--json", "--impure", "--expr", &expr])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("Failed to discover tests for {}: {}", attr, e);
+            return vec![];
+        }
+    };
+
+    if !output.status.success() {
+        // No tests or eval error - this is fine
+        return vec![];
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match serde_json::from_str::<Vec<String>>(&stdout) {
+        Ok(tests) => {
+            if !tests.is_empty() {
+                info!("Found {} test(s) for {}: {:?}", tests.len(), attr, tests);
+            }
+            tests
+        }
+        Err(e) => {
+            warn!("Failed to parse tests for {}: {}", attr, e);
+            vec![]
+        }
+    }
 }
 
 /// Helper function to run a nix build command and stream output to a file and console

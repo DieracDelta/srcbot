@@ -13,7 +13,7 @@ use crate::commands::run_command_async;
 use crate::full_eval_types::EvalJobOutput;
 use crate::git::fetch_pr_ref;
 use crate::github::{create_gist_and_comment, fetch_pr_info, post_github_comment};
-use crate::nix::{build_intermediate_async, build_package_async, pkg_attr_exists, run_nix_eval_jobs};
+use crate::nix::{build_intermediate_async, build_package_async, build_test_async, discover_tests, pkg_attr_exists, run_nix_eval_jobs};
 use crate::summary::build_summary_comment;
 use crate::types::{
     ChangedPackage, ChangedPackageSer, FullEvalBuildResult, RemoteBuilderConfig, RunState,
@@ -100,11 +100,13 @@ pub fn find_changed_packages(
                     .unwrap_or(usize::MAX)
             });
 
+            // Tests will be discovered lazily at build time
             changed.push(ChangedPackage {
                 attr: pr_pkg.attr.clone(),
                 changed_intermediates,
                 intermediate_drv_paths,
                 final_drv_changed: false,
+                tests: vec![],
             });
         } else if verify_full_drvs {
             // No intermediate changes - check if final drvPath changed
@@ -142,11 +144,13 @@ pub fn find_changed_packages(
                         (vec![], HashMap::new())
                     };
 
+                    // Tests will be discovered lazily at build time
                     changed.push(ChangedPackage {
                         attr: pr_pkg.attr.clone(),
                         changed_intermediates: intermediates,
                         intermediate_drv_paths: drv_paths,
                         final_drv_changed: true,
+                        tests: vec![],
                     });
                 }
             }
@@ -297,6 +301,7 @@ async fn build_packages_for_system(
     nix_timeout: u64,
     full_rebuild: bool,
     false_positive: bool,
+    skip_tests: bool,
     base_worktree_exists: Arc<Mutex<bool>>,
     saved_intermediate_results: HashMap<String, Vec<(String, bool, String)>>,
 ) -> Result<Vec<FullEvalBuildResult>> {
@@ -334,6 +339,7 @@ async fn build_packages_for_system(
                     intermediate_results: saved_intermediates,
                     package_success: false,
                     package_logs: String::new(),
+                    test_results: vec![],
                     is_false_positive: false,
                     is_non_deterministic: false,
                     exists_on_base: true, // Will be set to false if detected as new package
@@ -631,6 +637,73 @@ async fn build_packages_for_system(
         }
     }
 
+    // Build tests for packages that succeeded
+    if !skip_tests {
+        // Discover tests lazily for packages that succeeded
+        let successful_attrs: Vec<String> = results
+            .iter()
+            .filter(|(_, r)| r.package_success)
+            .map(|(attr, _)| attr.clone())
+            .collect();
+
+        let mut packages_with_tests: Vec<(String, Vec<String>)> = Vec::new();
+        for attr in successful_attrs {
+            let tests = discover_tests(&pr_path, &attr, &system).await;
+            if !tests.is_empty() {
+                packages_with_tests.push((attr, tests));
+            }
+        }
+
+        if !packages_with_tests.is_empty() {
+            let total_tests: usize = packages_with_tests.iter().map(|(_, t)| t.len()).sum();
+            info!(
+                "[{}] Building {} tests for {} packages...",
+                system,
+                total_tests,
+                packages_with_tests.len()
+            );
+
+            // Flatten into (pkg_attr, test_name) tuples for parallel execution
+            let test_builds: Vec<(String, String)> = packages_with_tests
+                .into_iter()
+                .flat_map(|(attr, tests)| {
+                    tests.into_iter().map(move |test| (attr.clone(), test))
+                })
+                .collect();
+
+            let mut stream = stream::iter(test_builds.into_iter().map(|(pkg_attr, test_name)| {
+                let pr_path_inner = pr_path.clone();
+                let sys_inner = system.clone();
+                let builders_clone = builders_str.clone();
+                async move {
+                    build_test_async(
+                        pr_path_inner,
+                        pkg_attr,
+                        test_name,
+                        sys_inner,
+                        pr_num,
+                        builders_clone.as_deref(),
+                    )
+                    .await
+                }
+            }))
+            .buffer_unordered(build_jobs);
+
+            while let Some((pkg_attr, test_name, success, logs)) = stream.next().await {
+                if let Some(result) = results.get_mut(&pkg_attr) {
+                    result.test_results.push((test_name.clone(), success, logs));
+                }
+                info!(
+                    "[{}] Test {}.tests.{}: {}",
+                    system,
+                    pkg_attr,
+                    test_name,
+                    if success { "PASSED" } else { "FAILED" }
+                );
+            }
+        }
+    }
+
     // Collect all results
     let all_results: Vec<FullEvalBuildResult> = results.into_values().collect();
     Ok(all_results)
@@ -643,6 +716,7 @@ async fn build_packages_for_system(
 /// If `false_positive` is true, when a build fails, check if it also fails on the base branch.
 /// If `verify_full_drvs` is true, also detect packages where the final drvPath changed (not just intermediates).
 /// If `aggressively_check_fods` is true, rebuild ALL intermediates for changed packages, not just changed ones.
+/// If `skip_tests` is true, skip building passthru.tests for changed packages.
 /// If `log_base_url` is provided, log URLs will be included in the summary.
 /// If `remote_config` is provided, builds for that system are routed to the remote builder.
 /// `cli_command` is the command that was run, for inclusion in the summary.
@@ -661,6 +735,7 @@ pub async fn process_pr_full_eval(
     base_commit_override: Option<&str>,
     verify_full_drvs: bool,
     aggressively_check_fods: bool,
+    skip_tests: bool,
     nix_timeout: u64,
     log_base_url: Option<&str>,
     remote_config: Option<&RemoteBuilderConfig>,
@@ -798,6 +873,7 @@ pub async fn process_pr_full_eval(
                 changed_intermediates: p.changed_intermediates.clone(),
                 intermediate_drv_paths: HashMap::new(),
                 final_drv_changed: p.final_drv_changed,
+                tests: p.tests.clone(),
             })
             .collect();
         let mut all_changed = HashMap::new();
@@ -1064,6 +1140,7 @@ pub async fn process_pr_full_eval(
                 nix_timeout,
                 full_rebuild,
                 false_positive,
+                skip_tests,
                 base_worktree_exists_clone,
                 saved_intermediate_results_clone,
             )
@@ -1105,6 +1182,7 @@ pub async fn process_pr_full_eval(
                 attr: p.attr.clone(),
                 changed_intermediates: p.changed_intermediates.clone(),
                 final_drv_changed: p.final_drv_changed,
+                tests: p.tests.clone(),
             })
             .collect(),
         intermediate_results: HashMap::new(),

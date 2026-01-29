@@ -70,6 +70,8 @@ pub struct ChangedPackage {
     /// True if the final package drvPath changed (but intermediates didn't)
     /// Only populated when --verify-full-drvs is used
     pub final_drv_changed: bool,
+    /// Test names from passthru.tests (e.g., ["meilisearch", "unit"])
+    pub tests: Vec<String>,
 }
 
 /// Result of building a package in full-eval mode
@@ -82,6 +84,9 @@ pub struct FullEvalBuildResult {
     pub intermediate_results: Vec<(String, bool, String)>, // (name, success, logs)
     pub package_success: bool,
     pub package_logs: String,
+    /// Test results: (test_name, success, logs)
+    #[serde(default)]
+    pub test_results: Vec<(String, bool, String)>,
     /// True if the failure also exists on the base branch (pre-existing failure)
     #[serde(default)]
     pub is_false_positive: bool,
@@ -106,6 +111,9 @@ pub struct ChangedPackageSer {
     /// True if the final package drvPath changed (but intermediates didn't)
     #[serde(default)]
     pub final_drv_changed: bool,
+    /// Test names from passthru.tests
+    #[serde(default)]
+    pub tests: Vec<String>,
 }
 
 /// Configuration for a remote builder
@@ -265,6 +273,7 @@ mod tests {
             ],
             package_success: false,
             package_logs: "failed".to_string(),
+            test_results: vec![],
             is_false_positive: false,
             is_non_deterministic: false,
             exists_on_base: true,
@@ -288,6 +297,7 @@ mod tests {
             intermediate_results: vec![("src".to_string(), false, "404".to_string())],
             package_success: false,
             package_logs: "".to_string(),
+            test_results: vec![],
             is_false_positive: true,
             is_non_deterministic: false,
             exists_on_base: true,
@@ -325,6 +335,7 @@ mod tests {
                 attr: "hello".to_string(),
                 changed_intermediates: vec!["src".to_string()],
                 final_drv_changed: false,
+                tests: vec![],
             }],
             intermediate_results: HashMap::new(),
             completed_results: vec![],
@@ -362,6 +373,7 @@ mod tests {
             attr: "myPackage".to_string(),
             changed_intermediates: vec!["src".to_string(), "cargoDeps".to_string()],
             final_drv_changed: false,
+            tests: vec!["unit".to_string()],
         };
         let json = serde_json::to_string(&pkg).unwrap();
         let deserialized: ChangedPackageSer = serde_json::from_str(&json).unwrap();
@@ -376,6 +388,7 @@ mod tests {
             attr: "finalOnlyPkg".to_string(),
             changed_intermediates: vec![],
             final_drv_changed: true,
+            tests: vec![],
         };
         let json = serde_json::to_string(&pkg).unwrap();
         let deserialized: ChangedPackageSer = serde_json::from_str(&json).unwrap();

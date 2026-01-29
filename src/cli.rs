@@ -101,6 +101,11 @@ pub struct VerifyArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub aggressively_check_fods: bool,
 
+    /// Skip building passthru.tests for changed packages.
+    /// By default, tests are built and test failures cause verification to fail.
+    #[arg(long, default_value_t = false)]
+    pub skip_tests: bool,
+
     /// Timeout in seconds for nix operations (builds, evals, etc.).
     /// Operations that exceed this timeout will be cancelled and marked as failed.
     #[arg(long, default_value_t = 3600)]
@@ -585,6 +590,41 @@ mod tests {
             assert!(
                 !verify_args.aggressively_check_fods,
                 "--aggressively-check-fods=false should disable it"
+            );
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_skip_tests_default_false() {
+        // Default should be false (tests are built by default)
+        let args = Args::try_parse_from(["srcbot", "verify", "--prs", "12345"]).unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert!(
+                !verify_args.skip_tests,
+                "--skip-tests should default to false"
+            );
+        } else {
+            panic!("Expected Verify command");
+        }
+    }
+
+    #[test]
+    fn test_skip_tests_flag() {
+        // Should be true when explicitly set
+        let args = Args::try_parse_from([
+            "srcbot",
+            "verify",
+            "--skip-tests",
+            "--prs",
+            "12345",
+        ])
+        .unwrap();
+        if let Commands::Verify(verify_args) = args.command {
+            assert!(
+                verify_args.skip_tests,
+                "--skip-tests should be true when set"
             );
         } else {
             panic!("Expected Verify command");

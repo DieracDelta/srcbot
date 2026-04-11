@@ -365,11 +365,20 @@ pub fn build_summary_comment(
             summary.push_str("| Package | Failed Tests |\n|---------|-------------|\n");
 
             for result in &test_failures {
-                let failed_tests: Vec<_> = result
+                let failed_tests: Vec<String> = result
                     .test_results
                     .iter()
                     .filter(|(_, s, _)| !*s)
-                    .map(|(name, _, _)| name.as_str())
+                    .map(|(name, _, _)| {
+                        // Add log link if log_url_base is provided
+                        if let Some(base) = log_url_base {
+                            let attr_safe = result.attr.replace(['.', '/'], "_");
+                            let log_url = format!("{}/{}.{}.test.{}.log", base, system, attr_safe, name);
+                            format!("[{}]({})", name, log_url)
+                        } else {
+                            name.clone()
+                        }
+                    })
                     .collect();
                 summary.push_str(&format!(
                     "| {} | {} |\n",
@@ -418,20 +427,28 @@ pub fn build_summary_comment(
                 } else {
                     ""
                 };
-                // Format test results
+                // Format test results with log links
                 let tests_str = if result.test_results.is_empty() {
                     "-".to_string()
                 } else {
-                    let passed_tests: Vec<_> = result
+                    let passed_tests: Vec<String> = result
                         .test_results
                         .iter()
                         .filter(|(_, s, _)| *s)
-                        .map(|(n, _, _)| n.as_str())
+                        .map(|(name, _, _)| {
+                            if let Some(base) = log_url_base {
+                                let attr_safe = result.attr.replace(['.', '/'], "_");
+                                let log_url = format!("{}/{}.{}.test.{}.log", base, system, attr_safe, name);
+                                format!("[{}]({})", name, log_url)
+                            } else {
+                                name.clone()
+                            }
+                        })
                         .collect();
                     if passed_tests.is_empty() {
                         "-".to_string()
                     } else {
-                        format!("✅ {}", passed_tests.join(", "))
+                        passed_tests.join(", ")
                     }
                 };
                 summary.push_str(&format!(

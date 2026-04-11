@@ -1241,7 +1241,10 @@ pub async fn process_pr_full_eval(
         .await;
     }
 
-    let all_success = all_results.iter().all(|r| r.package_success);
+    // Check both package success and test success
+    let all_success = all_results.iter().all(|r| {
+        r.package_success && r.test_results.iter().all(|(_, success, _)| *success)
+    });
 
     // Always persist logs locally
     let log_dir = save_logs_locally(pr_num, &all_results)?;

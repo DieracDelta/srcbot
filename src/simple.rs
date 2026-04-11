@@ -284,8 +284,8 @@ pub async fn process_pr(
             tests_passed, tests_failed
         ));
         for (test_name, success, logs) in &test_results {
-            let status = if *success { "✅" } else { "❌" };
-            message.push_str(&format!("#### {}.tests.{} {}\n\n", attr, test_name, status));
+            let status = if *success { "PASSED" } else { "FAILED" };
+            message.push_str(&format!("#### {}.tests.{}: {}\n\n", attr, test_name, status));
             message.push_str(&format_log(logs, &format!("{} Test", test_name)));
             message.push_str("\n\n");
         }

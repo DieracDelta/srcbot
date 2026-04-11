@@ -9,21 +9,34 @@
     };
   };
 
-  outputs = { self, nixpkgs, rust-overlay }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+    }:
     let
-      supportedSystems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      supportedSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
-      pkgsFor = system: import nixpkgs {
-        inherit system;
-        overlays = [ (import rust-overlay) ];
-      };
+      pkgsFor =
+        system:
+        import nixpkgs {
+          inherit system;
+          overlays = [ (import rust-overlay) ];
+        };
     in
     {
-      devShells = forAllSystems (system:
+      devShells = forAllSystems (
+        system:
         let
           pkgs = pkgsFor system;
           rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-            extensions = [ "rust-src" "rust-analyzer" ];
+            extensions = [ "rust-src" ];
           };
         in
         {
@@ -37,9 +50,12 @@
         }
       );
 
-      packages = forAllSystems (system:
-        let pkgs = pkgsFor system;
-        in {
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = pkgsFor system;
+        in
+        {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "srcbot";
             version = "0.1.0";
